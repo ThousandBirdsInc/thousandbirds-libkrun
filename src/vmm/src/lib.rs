@@ -57,6 +57,7 @@ use crossbeam_channel::Sender;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use devices::fdt;
 use devices::legacy::IrqChip;
+use devices::virtio::BalloonControl;
 use devices::virtio::VmmExitObserver;
 use devices::{BusDevice, DeviceType};
 use kernel::cmdline::Cmdline as KernelCmdline;
@@ -205,6 +206,10 @@ pub struct Vmm {
     exit_observers: Vec<Arc<Mutex<dyn VmmExitObserver>>>,
     exit_code: Arc<AtomicI32>,
 
+    /// Runtime handle for adjusting the virtio-balloon target, if a balloon
+    /// with resize support was attached.
+    balloon_control: Option<BalloonControl>,
+
     // Guest VM devices.
     mmio_device_manager: MMIODeviceManager,
     #[cfg(target_arch = "x86_64")]
@@ -212,6 +217,17 @@ pub struct Vmm {
 }
 
 impl Vmm {
+    /// Returns a cloneable handle for adjusting the balloon target at runtime,
+    /// if a resize-capable balloon was attached.
+    pub fn balloon_control(&self) -> Option<BalloonControl> {
+        self.balloon_control.clone()
+    }
+
+    /// Records the balloon control handle (called during device attach).
+    pub fn set_balloon_control(&mut self, control: BalloonControl) {
+        self.balloon_control = Some(control);
+    }
+
     /// Gets the the specified bus device.
     pub fn get_bus_device(
         &self,

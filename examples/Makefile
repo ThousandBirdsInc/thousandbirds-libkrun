@@ -13,7 +13,7 @@ ROOTFS_DIR = rootfs_$(ROOTFS_DISTRO)
 
 .PHONY: clean rootfs
 
-EXAMPLES := boot_efi chroot_vm external_kernel consoles
+EXAMPLES := boot_efi chroot_vm external_kernel consoles os_mode
 ifeq ($(SEV),1)
     EXAMPLES := launch-tee
 endif
@@ -49,6 +49,12 @@ ifeq ($(OS),Darwin)
 	codesign --entitlements chroot_vm.entitlements --force -s - $@
 endif
 
+os_mode: os_mode.c
+	gcc -o $@ $< $(CFLAGS) $(LDFLAGS_$(ARCH)_$(OS))
+ifeq ($(OS),Darwin)
+	codesign --entitlements chroot_vm.entitlements --force -s - $@
+endif
+
 consoles: consoles.c
 	gcc -o $@ $< $(CFLAGS) $(LDFLAGS_$(ARCH)_$(OS))
 
@@ -63,4 +69,4 @@ rootfs:
 	podman rm libkrun_chroot_vm
 
 clean:
-	rm -rf chroot_vm $(ROOTFS_DIR) launch-tee boot_efi external_kernel nitro consoles
+	rm -rf chroot_vm $(ROOTFS_DIR) launch-tee boot_efi external_kernel nitro consoles os_mode *.dSYM

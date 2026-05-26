@@ -98,6 +98,27 @@ int32_t krun_free_ctx(uint32_t ctx_id);
 int32_t krun_set_vm_config(uint32_t ctx_id, uint8_t num_vcpus, uint32_t ram_mib);
 
 /**
+ * Enables runtime memory resizing via the virtio-balloon device.
+ *
+ * Must be called before krun_start_enter(). The VM boots with the RAM set by
+ * krun_set_vm_config() as a fixed ceiling. The balloon starts inflated so the
+ * guest's usable memory equals "initial_mib"; it can then be resized within
+ * [min_mib, ceiling] by writing line commands to the Unix socket created at
+ * "control_socket_path" (e.g. "target-mib 1024\n").
+ *
+ * Arguments:
+ *  "ctx_id"              - the configuration context ID.
+ *  "initial_mib"         - guest usable memory at boot, in MiB (<= ceiling).
+ *  "min_mib"             - floor for runtime reclaim, in MiB (<= ceiling).
+ *  "control_socket_path" - path for the control Unix socket, or NULL to skip.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_balloon(uint32_t ctx_id, uint32_t initial_mib, uint32_t min_mib,
+                         const char *control_socket_path);
+
+/**
  * The virtiofs tag used for the root filesystem. Can be used with krun_add_virtiofs*
  * for more control over root filesystem parameters (e.g. read-only, DAX window size).
  */
@@ -355,6 +376,8 @@ int32_t krun_add_virtiofs3(uint32_t ctx_id,
 /* Send the VFKIT magic after establishing the connection,
    as required by gvproxy in vfkit mode. */
 #define NET_FLAG_VFKIT (1 << 0)
+/* Ask libkrun's workload init to configure DHCP. Invalid in OS mode because
+ * OS-mode guests must run their own network configuration. */
 #define NET_FLAG_DHCP_CLIENT (1 << 1)
 
 /* TSI (Transparent Socket Impersonation) feature flags for vsock */
@@ -723,12 +746,12 @@ int krun_add_input_device(uint32_t ctx_id, const void *config_backend, size_t co
                             const void *events_backend, size_t events_backend_size);
 
 /**
- * Creates a passthrough input device from a host /dev/input/* file descriptor.
+ * Creates a passthrough input device from a host /dev/input/eventN file descriptor.
  * The device configuration will be automatically queried from the host device using ioctls.
  * 
  * Arguments:
  *  "ctx_id"  - The krun context
- *  "input_fd" - File descriptor to a /dev/input/* device on the host
+ *  "input_fd" - File descriptor to a /dev/input/eventN device on the host
  *
  * Returns:
  *  Zero on success or a negative error code otherwise.
@@ -949,6 +972,75 @@ int32_t krun_set_kernel(uint32_t ctx_id,
                         const char *cmdline);
 
 /**
+ * Configures the context to boot a complete Linux OS instead of the default
+ * single-workload init.krun environment.
+ *
+ * In OS mode libkrun does not inject init=/init.krun, KRUN_* workload
+ * handoff variables, or "-- <workload args>" into the guest kernel command
+ * line. The caller must configure a direct-boot kernel, at least one block
+ * device, and an OS root with krun_set_os_root().
+ *
+ * Workload-only APIs such as krun_set_exec(), krun_set_workdir(),
+ * krun_set_env(), krun_set_rlimits(), and krun_set_root_disk_remount()
+ * are invalid after this mode is enabled. krun_add_virtiofs*() remains valid
+ * for non-root shared filesystems, but KRUN_FS_ROOT_TAG is invalid because OS
+ * mode root filesystems must come from the configured block root.
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_os_mode(uint32_t ctx_id);
+
+/**
+ * Configures the init process for OS mode.
+ *
+ * If this function is not called, OS mode appends init=/sbin/init to the
+ * kernel command line. This function must be called after krun_set_os_mode()
+ * and before krun_start_enter().
+ *
+ * Arguments:
+ *  "ctx_id"    - the configuration context ID.
+ *  "init_path" - guest path to use as PID 1, for example "/sbin/init".
+ *                The value must be a single kernel command-line token with
+ *                no whitespace.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_os_init(uint32_t ctx_id, const char *init_path);
+
+/**
+ * Configures the guest kernel root filesystem for OS mode.
+ *
+ * This function is similar to krun_set_root_disk_remount(), but it does not
+ * create a temporary virtiofs root and does not depend on init.krun. Instead,
+ * libkrun appends root=, rootfstype=, and rootflags= parameters to the kernel
+ * command line so the guest kernel mounts the real root directly.
+ *
+ * krun_set_os_mode() must be called first, and at least one block device must
+ * already be configured with krun_add_disk*() or krun_set_root_disk().
+ *
+ * Arguments:
+ *  "ctx_id"  - the configuration context ID.
+ *  "device"  - the guest root device, for example "/dev/vda1".
+ *  "fstype"  - filesystem type, for example "ext4"; use "auto" or NULL to omit.
+ *  "options" - comma-separated root mount options; may be NULL.
+ *              Non-NULL values must be single kernel command-line tokens with
+ *              no whitespace, because libkrun appends them directly as
+ *              root=, rootfstype=, and rootflags= parameters.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_os_root(uint32_t ctx_id,
+                         const char *device,
+                         const char *fstype,
+                         const char *options);
+
+/**
  * Sets environment variables to be configured in the context of the executable.
  *
  * Arguments:
@@ -976,6 +1068,8 @@ int32_t krun_set_tee_config_file(uint32_t ctx_id, const char *filepath);
 
 /**
  * Adds a port-path pairing for guest IPC with a process in the host.
+ * In OS mode, this API requires an explicit vsock device created with
+ * krun_add_vsock(ctx, 0); implicit vsock is disabled for OS-mode boots.
  *
  * Arguments:
  *  "ctx_id"    - the configuration context ID.
@@ -989,6 +1083,8 @@ int32_t krun_add_vsock_port(uint32_t ctx_id,
 
 /**
  * Adds a port-path pairing for guest IPC with a process in the host.
+ * In OS mode, this API requires an explicit vsock device created with
+ * krun_add_vsock(ctx, 0); implicit vsock is disabled for OS-mode boots.
  *
  * Arguments:
  *  "ctx_id"    - the configuration context ID.
@@ -1008,6 +1104,8 @@ int32_t krun_add_vsock_port2(uint32_t ctx_id,
  * By default, libkrun creates a vsock device implicitly with TSI hijacking
  * enabled based on heuristics. To use this function, you must first call
  * krun_disable_implicit_vsock() to disable the implicit vsock device.
+ * In OS mode, tsi_features must be 0 because TSI hijacking depends on
+ * workload-mode guest/kernel behavior. Plain vsock without TSI remains valid.
  *
  * Currently only one vsock device is supported. Calling this function
  * multiple times will return an error.
@@ -1183,9 +1281,11 @@ int32_t krun_disable_implicit_vsock(uint32_t ctx_id);
 
 /*
  * Specify the value of `console=` in the kernel commandline.
+ * In OS mode, this value must be a non-empty single kernel command-line token
+ * with no whitespace.
  *
  * Arguments:
- *  "ctx_id" - the confiugration context ID.
+ *  "ctx_id" - the configuration context ID.
  *  "console_id" - console identifier.
  *
  * Returns

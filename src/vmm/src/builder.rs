@@ -596,15 +596,19 @@ pub fn build_microvm(
 
     if let Some(kernel_console) = &vm_resources.kernel_console {
         let cmdline = kernel_cmdline.as_str();
-        let console_start_idx = cmdline.find("console=").unwrap();
-        let console_end_idx = cmdline
-            .get(console_start_idx..)
-            .and_then(|s| s.find(" ").map(|i| i + console_start_idx));
+        let cmdline = if let Some(console_start_idx) = cmdline.find("console=") {
+            let console_end_idx = cmdline
+                .get(console_start_idx..)
+                .and_then(|s| s.find(' ').map(|i| i + console_start_idx))
+                .unwrap_or(cmdline.len());
 
-        let cmdline = cmdline.replace(
-            &cmdline[console_start_idx..console_end_idx.unwrap()],
-            format!("console={kernel_console}").as_str(),
-        );
+            cmdline.replace(
+                &cmdline[console_start_idx..console_end_idx],
+                format!("console={kernel_console}").as_str(),
+            )
+        } else {
+            format!("{cmdline} console={kernel_console}")
+        };
         kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
         kernel_cmdline.insert_str(cmdline).unwrap();
     }
@@ -958,6 +962,7 @@ pub fn build_microvm(
         exit_observers: Vec::new(),
         exit_code: exit_code.clone(),
         vm,
+        balloon_control: None,
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
@@ -969,7 +974,7 @@ pub fn build_microvm(
     }
 
     #[cfg(not(feature = "tee"))]
-    attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
+    attach_balloon_device(&mut vmm, event_manager, intc.clone(), vm_resources.balloon)?;
     #[cfg(not(feature = "tee"))]
     {
         #[cfg(all(feature = "vhost-user", target_os = "linux"))]
@@ -2341,16 +2346,26 @@ fn attach_balloon_device(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,
     intc: IrqChip,
+    balloon_cfg: crate::resources::BalloonResize,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
-    let balloon = Arc::new(Mutex::new(devices::virtio::Balloon::new().unwrap()));
+    let balloon = Arc::new(Mutex::new(
+        devices::virtio::Balloon::new(balloon_cfg.initial_pages, balloon_cfg.max_pages).unwrap(),
+    ));
 
     event_manager
         .add_subscriber(balloon.clone())
         .map_err(RegisterEvent)?;
 
-    let id = String::from(balloon.lock().unwrap().id());
+    let (id, control) = {
+        let dev = balloon.lock().unwrap();
+        (String::from(dev.id()), dev.control())
+    };
+    // Expose the resize handle if a balloon with non-zero ceiling was requested.
+    if balloon_cfg.max_pages > 0 {
+        vmm.set_balloon_control(control);
+    }
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc.clone(), balloon).map_err(RegisterBalloonDevice)?;

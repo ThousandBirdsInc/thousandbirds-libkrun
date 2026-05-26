@@ -10,6 +10,9 @@ jobs:
       
       - name: Setup build environment
         uses: ./.github/actions/setup-build-env
+
+      - name: OS-mode host-independent checks
+        run: make os-mode-checks
       
       - name: Create a fake init
         run: touch init/init
@@ -34,6 +37,9 @@ jobs:
       
       - name: Setup build environment
         uses: ./.github/actions/setup-build-env
+
+      - name: OS-mode host-independent checks
+        run: make os-mode-checks
       
       - name: Create a fake init
         run: touch init/init
@@ -52,6 +58,9 @@ jobs:
       
       - name: Setup build environment
         uses: ./.github/actions/setup-build-env
+
+      - name: OS-mode host-independent checks
+        run: make os-mode-checks
       
       - name: Create a fake init
         run: touch init/init

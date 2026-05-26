@@ -83,7 +83,7 @@ ifeq ($(PREFIX),)
     PREFIX := /usr/local
 endif
 
-.PHONY: install clean test test-prefix $(LIBRARY_RELEASE_$(OS)) $(LIBRARY_DEBUG_$(OS)) libkrun.pc clean-sysroot clean-all
+.PHONY: install clean test test-prefix os-mode-checks os-mode-clean-host-baseline os-mode-verify-release-evidence os-mode-accept-clean-host os-mode-design-doc-baseline os-mode-audit-final-baseline $(LIBRARY_RELEASE_$(OS)) $(LIBRARY_DEBUG_$(OS)) libkrun.pc clean-sysroot clean-all
 
 all: $(LIBRARY_RELEASE_$(OS)) libkrun.pc
 
@@ -255,6 +255,134 @@ endif
 	cd tests; cargo clean
 
 clean-all: clean clean-sysroot
+
+os-mode-checks:
+	ci/os_mode_host_checks.sh
+
+OS_MODE_CLEAN_HOST_BASELINE_SOURCE =
+ifneq ($(ARTIFACT_MANIFEST),)
+ifneq ($(IMAGE),)
+OS_MODE_CLEAN_HOST_BASELINE_SOURCE += "$(IMAGE)"
+endif
+OS_MODE_CLEAN_HOST_BASELINE_SOURCE += --artifact-manifest "$(ARTIFACT_MANIFEST)"
+else
+OS_MODE_CLEAN_HOST_BASELINE_SOURCE += "$(IMAGE)"
+endif
+
+OS_MODE_CLEAN_HOST_BASELINE_FLAGS =
+ifneq ($(CACHE_DIR),)
+OS_MODE_CLEAN_HOST_BASELINE_FLAGS += --cache-dir "$(CACHE_DIR)"
+endif
+ifneq ($(NAME),)
+OS_MODE_CLEAN_HOST_BASELINE_FLAGS += --name "$(NAME)"
+endif
+ifneq ($(RUNTIME),)
+OS_MODE_CLEAN_HOST_BASELINE_FLAGS += --runtime "$(RUNTIME)"
+endif
+ifneq ($(BUILD_COMMAND),)
+OS_MODE_CLEAN_HOST_BASELINE_FLAGS += --build-command "$(BUILD_COMMAND)"
+endif
+ifneq ($(PREFLIGHT_JSON),)
+OS_MODE_CLEAN_HOST_BASELINE_FLAGS += --preflight-json "$(PREFLIGHT_JSON)"
+endif
+ifneq ($(ACCEPT_JSON_OUTPUT),)
+OS_MODE_CLEAN_HOST_BASELINE_FLAGS += --accept-json-output "$(ACCEPT_JSON_OUTPUT)"
+endif
+ifneq ($(ACCEPT_TABLE_OUTPUT),)
+OS_MODE_CLEAN_HOST_BASELINE_FLAGS += --accept-table-output "$(ACCEPT_TABLE_OUTPUT)"
+endif
+ifneq ($(DESIGN_DOC_OUTPUT),)
+OS_MODE_CLEAN_HOST_BASELINE_FLAGS += --design-doc-output "$(DESIGN_DOC_OUTPUT)"
+endif
+ifneq ($(EVIDENCE_LABEL),)
+OS_MODE_CLEAN_HOST_BASELINE_FLAGS += --evidence-label "$(EVIDENCE_LABEL)"
+endif
+ifeq ($(FINAL_RELEASE_BASELINE),1)
+OS_MODE_CLEAN_HOST_BASELINE_FLAGS += --final-release-baseline
+endif
+ifneq ($(PRINT_ONLY),)
+OS_MODE_CLEAN_HOST_BASELINE_FLAGS += --print-only
+endif
+
+os-mode-clean-host-baseline:
+	@test -n "$(OUTPUT_DIR)" || { echo "OUTPUT_DIR is required, for example: make os-mode-clean-host-baseline IMAGE=registry.example.com/os@sha256:... OUTPUT_DIR=path/to/release-evidence"; exit 2; }
+	@test -n "$(IMAGE)$(ARTIFACT_MANIFEST)" || { echo "IMAGE or ARTIFACT_MANIFEST is required"; exit 2; }
+	@if test -n "$(DESIGN_DOC_OUTPUT)" && test -z "$(ACCEPT_JSON_OUTPUT)"; then echo "ACCEPT_JSON_OUTPUT is required when DESIGN_DOC_OUTPUT is set"; exit 2; fi
+	@if { test -n "$(EVIDENCE_LABEL)" || test "$(FINAL_RELEASE_BASELINE)" = "1"; } && test -z "$(DESIGN_DOC_OUTPUT)"; then echo "DESIGN_DOC_OUTPUT is required when EVIDENCE_LABEL or FINAL_RELEASE_BASELINE=1 is set"; exit 2; fi
+	@if test "$(FINAL_RELEASE_BASELINE)" = "1" && test -z "$(ACCEPT_TABLE_OUTPUT)"; then echo "ACCEPT_TABLE_OUTPUT is required when FINAL_RELEASE_BASELINE=1 is set"; exit 2; fi
+	examples/os_mode_clean_host_baseline.py $(OS_MODE_CLEAN_HOST_BASELINE_SOURCE) --output-dir "$(OUTPUT_DIR)" $(OS_MODE_CLEAN_HOST_BASELINE_FLAGS)
+
+OS_MODE_VERIFY_FLAGS = \
+		--require-clean-cache \
+		--require-cache-entry-absent \
+		--require-apfs \
+		--require-macos-arm64 \
+		--require-perf \
+		--require-clean-poweroff \
+		--require-clean-host-preflight \
+		--require-build-provenance
+ifeq ($(ARTIFACT),1)
+OS_MODE_VERIFY_FLAGS += --require-artifact-manifest --require-artifact-load
+endif
+ifeq ($(PULL),1)
+OS_MODE_VERIFY_FLAGS += --require-pull
+endif
+
+os-mode-verify-release-evidence:
+	@test -n "$(EVIDENCE_DIR)" || { echo "EVIDENCE_DIR is required, for example: make os-mode-verify-release-evidence EVIDENCE_DIR=path/to/release-evidence"; exit 2; }
+	examples/os_mode_verify_release_evidence.py "$(EVIDENCE_DIR)" $(OS_MODE_VERIFY_FLAGS)
+
+OS_MODE_ACCEPT_FLAGS =
+ifeq ($(ARTIFACT),1)
+OS_MODE_ACCEPT_FLAGS += --artifact
+endif
+ifeq ($(PULL),1)
+OS_MODE_ACCEPT_FLAGS += --pull
+endif
+ifneq ($(JSON_OUTPUT),)
+OS_MODE_ACCEPT_FLAGS += --json-output "$(JSON_OUTPUT)"
+endif
+ifneq ($(TABLE_OUTPUT),)
+OS_MODE_ACCEPT_FLAGS += --table-output "$(TABLE_OUTPUT)"
+endif
+ifeq ($(FINAL_RELEASE_BASELINE),1)
+OS_MODE_ACCEPT_FLAGS += --final-release-baseline
+endif
+
+os-mode-accept-clean-host:
+	@test -n "$(EVIDENCE_DIR)" || { echo "EVIDENCE_DIR is required, for example: make os-mode-accept-clean-host EVIDENCE_DIR=path/to/release-evidence"; exit 2; }
+	@if test "$(FINAL_RELEASE_BASELINE)" = "1" && test -z "$(JSON_OUTPUT)"; then echo "JSON_OUTPUT is required when FINAL_RELEASE_BASELINE=1 is set"; exit 2; fi
+	@if test "$(FINAL_RELEASE_BASELINE)" = "1" && test -z "$(TABLE_OUTPUT)"; then echo "TABLE_OUTPUT is required when FINAL_RELEASE_BASELINE=1 is set"; exit 2; fi
+	examples/os_mode_clean_host_acceptance.py "$(EVIDENCE_DIR)" $(OS_MODE_ACCEPT_FLAGS)
+
+OS_MODE_DESIGN_DOC_BASELINE_FLAGS =
+ifneq ($(EVIDENCE_LABEL),)
+OS_MODE_DESIGN_DOC_BASELINE_FLAGS += --evidence-label "$(EVIDENCE_LABEL)"
+endif
+ifeq ($(FINAL_RELEASE_BASELINE),1)
+OS_MODE_DESIGN_DOC_BASELINE_FLAGS += --final-release-baseline
+endif
+ifneq ($(DESIGN_DOC_OUTPUT),)
+OS_MODE_DESIGN_DOC_BASELINE_FLAGS += --output "$(DESIGN_DOC_OUTPUT)"
+endif
+
+os-mode-design-doc-baseline:
+	@test -n "$(ACCEPTANCE_JSON)" || { echo "ACCEPTANCE_JSON is required, for example: make os-mode-design-doc-baseline ACCEPTANCE_JSON=path/to/acceptance.json"; exit 2; }
+	examples/os_mode_design_doc_baseline.py "$(ACCEPTANCE_JSON)" $(OS_MODE_DESIGN_DOC_BASELINE_FLAGS)
+
+OS_MODE_FINAL_BASELINE_AUDIT_FLAGS =
+ifneq ($(EVIDENCE_DIR),)
+OS_MODE_FINAL_BASELINE_AUDIT_FLAGS += --evidence-dir "$(EVIDENCE_DIR)"
+endif
+ifneq ($(EVIDENCE_LABEL),)
+OS_MODE_FINAL_BASELINE_AUDIT_FLAGS += --evidence-label "$(EVIDENCE_LABEL)"
+endif
+
+os-mode-audit-final-baseline:
+	@test -n "$(ACCEPTANCE_JSON)" || { echo "ACCEPTANCE_JSON is required, for example: make os-mode-audit-final-baseline ACCEPTANCE_JSON=path/to/acceptance.json TABLE_OUTPUT=path/to/baseline.md DESIGN_DOC_OUTPUT=path/to/design-doc.md"; exit 2; }
+	@test -n "$(TABLE_OUTPUT)" || { echo "TABLE_OUTPUT is required"; exit 2; }
+	@test -n "$(DESIGN_DOC_OUTPUT)" || { echo "DESIGN_DOC_OUTPUT is required"; exit 2; }
+	examples/os_mode_final_baseline_audit.py "$(ACCEPTANCE_JSON)" --table "$(TABLE_OUTPUT)" --design-doc "$(DESIGN_DOC_OUTPUT)" $(OS_MODE_FINAL_BASELINE_AUDIT_FLAGS)
 
 test-prefix/$(LIBDIR_$(OS))/libkrun.pc: $(LIBRARY_RELEASE_$(OS))
 	mkdir -p test-prefix

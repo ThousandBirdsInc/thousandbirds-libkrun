@@ -12,8 +12,6 @@ impl Balloon {
     }
 
     pub(crate) fn handle_ifq_event(&mut self, event: &EpollEvent) {
-        error!("balloon: unsupported inflate queue event");
-
         let event_set = event.event_set();
         if event_set != EventSet::IN {
             warn!("balloon: inflate unexpected event {event_set:?}");
@@ -22,12 +20,12 @@ impl Balloon {
 
         if let Err(e) = self.queue_event(IFQ_INDEX).read() {
             error!("Failed to read balloon inflate queue event: {e:?}");
+        } else if self.process_ifq() {
+            self.device_state.signal_used_queue();
         }
     }
 
     pub(crate) fn handle_dfq_event(&mut self, event: &EpollEvent) {
-        error!("balloon: unsupported deflate queue event");
-
         let event_set = event.event_set();
         if event_set != EventSet::IN {
             warn!("balloon: deflate unexpected event {event_set:?}");
@@ -35,8 +33,24 @@ impl Balloon {
         }
 
         if let Err(e) = self.queue_event(DFQ_INDEX).read() {
-            error!("Failed to read balloon inflate queue event: {e:?}");
+            error!("Failed to read balloon deflate queue event: {e:?}");
+        } else if self.process_dfq() {
+            self.device_state.signal_used_queue();
         }
+    }
+
+    pub(crate) fn handle_control_event(&mut self, event: &EpollEvent) {
+        let event_set = event.event_set();
+        if event_set != EventSet::IN {
+            warn!("balloon: control unexpected event {event_set:?}");
+            return;
+        }
+
+        if let Err(e) = self.control_evt.read() {
+            error!("Failed to read balloon control event: {e:?}");
+            return;
+        }
+        self.apply_control_target();
     }
 
     pub(crate) fn handle_stq_event(&mut self, event: &EpollEvent) {
@@ -146,6 +160,21 @@ impl Balloon {
             });
 
         event_manager
+            .register(
+                self.control_evt.as_raw_fd(),
+                EpollEvent::new(EventSet::IN, self.control_evt.as_raw_fd() as u64),
+                self_subscriber.clone(),
+            )
+            .unwrap_or_else(|e| {
+                error!("Failed to register balloon control evt with event manager: {e:?}");
+            });
+
+        // A resize requested before activation leaves the control eventfd
+        // signalled (counter > 0); epoll reports it readable as soon as it is
+        // registered above, so handle_control_event will apply it. No explicit
+        // apply needed here (and `self` is only borrowed immutably).
+
+        event_manager
             .unregister(self.activate_evt.as_raw_fd())
             .unwrap_or_else(|e| {
                 error!("Failed to unregister balloon activate evt: {e:?}");
@@ -161,6 +190,7 @@ impl Subscriber for Balloon {
         let stq = self.queue_event(STQ_INDEX).as_raw_fd();
         let phq = self.queue_event(PHQ_INDEX).as_raw_fd();
         let frq = self.queue_event(FRQ_INDEX).as_raw_fd();
+        let control = self.control_evt.as_raw_fd();
         let activate_evt = self.activate_evt.as_raw_fd();
 
         if self.is_activated() {
@@ -170,6 +200,7 @@ impl Subscriber for Balloon {
                 _ if source == stq => self.handle_stq_event(event),
                 _ if source == phq => self.handle_phq_event(event),
                 _ if source == frq => self.handle_frq_event(event),
+                _ if source == control => self.handle_control_event(event),
                 _ if source == activate_evt => {
                     self.handle_activate_event(event_manager);
                 }

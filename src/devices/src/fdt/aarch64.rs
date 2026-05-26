@@ -202,7 +202,7 @@ fn create_chosen_node<T: DeviceInfoForFDT + Clone + Debug>(
     // it becomes available later, and this gives us a good fallback.
     for ((device_type, _device_id), info) in dev_info {
         if device_type == &DeviceType::Serial {
-            fdt.property_string("stdout-path", &format!("/uart@{:x}", info.addr()))?;
+            fdt.property_string("stdout-path", &format!("/pl011@{:x}", info.addr()))?;
         }
     }
 
@@ -342,12 +342,16 @@ fn create_serial_node<T: DeviceInfoForFDT + Clone + Debug>(
         IRQ_TYPE_EDGE_RISING,
     ]);
 
-    let node = fdt.begin_node(&format!("uart@{:x}", dev_info.addr()))?;
-    fdt.property_string("compatible", "arm,pl011")?;
+    let compatible = b"arm,pl011\0arm,primecell\0";
+    let clocks = generate_prop32(&[CLOCK_PHANDLE, CLOCK_PHANDLE]);
+    let clock_names = b"uartclk\0apb_pclk\0";
+
+    let node = fdt.begin_node(&format!("pl011@{:x}", dev_info.addr()))?;
+    fdt.property("compatible", compatible)?;
     fdt.property_string("status", "okay")?;
     fdt.property("reg", &serial_reg_prop)?;
-    fdt.property_u32("clocks", CLOCK_PHANDLE)?;
-    fdt.property_string("clock-names", "apb_pclk")?;
+    fdt.property("clocks", &clocks)?;
+    fdt.property("clock-names", clock_names)?;
     fdt.property("interrupts", &irq)?;
     fdt.end_node(node)?;
 

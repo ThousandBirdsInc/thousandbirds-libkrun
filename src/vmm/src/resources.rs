@@ -207,6 +207,22 @@ pub struct VmResources {
     pub virtio_consoles: Vec<VirtioConsoleConfigMode>,
     /// Enable the embedded dhcp client in init.c
     pub dhcp_client: bool,
+    /// Runtime memory-resize (virtio-balloon) configuration.
+    pub balloon: BalloonResize,
+}
+
+/// Configures the virtio-balloon device for runtime memory resizing.
+///
+/// The VM always boots with `mem_size_mib` of RAM (the ceiling). To allow
+/// growing the guest's usable memory later, boot with a higher ceiling and
+/// start the balloon inflated by `initial_pages`; reclaim is bounded by
+/// `max_pages`. Both zero (the default) disables resizing.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct BalloonResize {
+    /// 4KiB pages the guest should relinquish at boot.
+    pub initial_pages: u32,
+    /// Maximum 4KiB pages that may be reclaimed from the guest at runtime.
+    pub max_pages: u32,
 }
 
 impl VmResources {

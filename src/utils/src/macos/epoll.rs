@@ -223,7 +223,9 @@ impl Epoll {
                         ptr::null(),
                     )
                 };
-                assert_eq!(ret, 0);
+                if ret != 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
             ControlOperation::Delete => {
                 let mut kevs: Vec<Kevent> = Vec::new();

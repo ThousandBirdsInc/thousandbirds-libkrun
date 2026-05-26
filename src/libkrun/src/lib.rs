@@ -38,8 +38,8 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use utils::eventfd::EventFd;
 use vmm::resources::{
-    DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags, VirtioConsoleConfigMode,
-    VmResources, VsockConfig,
+    BalloonResize, DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags,
+    VirtioConsoleConfigMode, VmResources, VsockConfig,
 };
 #[cfg(feature = "blk")]
 use vmm::vmm_config::block::{BlockDeviceConfig, BlockRootConfig};
@@ -52,7 +52,9 @@ use vmm::vmm_config::fs::FsDeviceConfig;
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 #[cfg(feature = "tee")]
 use vmm::vmm_config::kernel_bundle::{InitrdBundle, QbootBundle};
-use vmm::vmm_config::kernel_cmdline::{KernelCmdlineConfig, DEFAULT_KERNEL_CMDLINE};
+use vmm::vmm_config::kernel_cmdline::{
+    KernelCmdlineConfig, DEFAULT_KERNEL_CMDLINE, OS_KERNEL_CMDLINE,
+};
 use vmm::vmm_config::machine_config::VmConfig;
 #[cfg(feature = "net")]
 use vmm::vmm_config::net::NetworkInterfaceConfig;
@@ -89,6 +91,14 @@ static KRUN_NITRO_DEBUG: Mutex<bool> = Mutex::new(false);
 
 // Path to the init binary to be executed inside the VM.
 const INIT_PATH: &str = "/init.krun";
+const OS_INIT_PATH: &str = "/sbin/init";
+
+#[cfg(target_arch = "x86_64")]
+const DEFAULT_SERIAL_KERNEL_CONSOLE: &str = "ttyS0";
+#[cfg(target_arch = "aarch64")]
+const DEFAULT_SERIAL_KERNEL_CONSOLE: &str = "ttyAMA0";
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const DEFAULT_SERIAL_KERNEL_CONSOLE: &str = "hvc0";
 
 static KRUNFW: LazyLock<Option<libloading::Library>> =
     LazyLock::new(|| unsafe { libloading::Library::new(KRUNFW_NAME).ok() });
@@ -133,10 +143,23 @@ enum LegacyNetworkConfig {
     VirtioNetGvproxy(PathBuf),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BootMode {
+    Workload,
+    Os,
+}
+
+impl Default for BootMode {
+    fn default() -> Self {
+        Self::Workload
+    }
+}
+
 #[derive(Default)]
 struct ContextConfig {
     krunfw: Option<KrunfwBindings>,
     vmr: VmResources,
+    boot_mode: BootMode,
     workdir: Option<String>,
     exec_path: Option<String>,
     env: Option<String>,
@@ -157,6 +180,9 @@ struct ContextConfig {
     data_block_cfg: Option<BlockDeviceConfig>,
     #[cfg(feature = "blk")]
     block_root: Option<BlockRootConfig>,
+    #[cfg(feature = "blk")]
+    os_root: Option<BlockRootConfig>,
+    os_init: Option<String>,
     #[cfg(feature = "tee")]
     tee_config_file: Option<PathBuf>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
@@ -166,9 +192,67 @@ struct ContextConfig {
     console_output: Option<PathBuf>,
     vmm_uid: Option<libc::uid_t>,
     vmm_gid: Option<libc::gid_t>,
+    /// Unix socket path for the runtime memory-resize control listener.
+    balloon_control_socket: Option<PathBuf>,
 }
 
 impl ContextConfig {
+    fn set_os_mode(&mut self) {
+        self.boot_mode = BootMode::Os;
+    }
+
+    fn is_os_mode(&self) -> bool {
+        self.boot_mode == BootMode::Os
+    }
+
+    fn has_workload_config(&self) -> bool {
+        self.workdir.is_some()
+            || self.exec_path.is_some()
+            || self.env.is_some()
+            || self.args.is_some()
+            || self.rlimits.is_some()
+            || {
+                #[cfg(not(feature = "tee"))]
+                {
+                    self.vmr.fs.iter().any(|fs| fs.fs_id == "/dev/root")
+                }
+                #[cfg(feature = "tee")]
+                {
+                    false
+                }
+            }
+            || {
+                #[cfg(feature = "blk")]
+                {
+                    self.block_root.is_some()
+                }
+                #[cfg(not(feature = "blk"))]
+                {
+                    false
+                }
+            }
+            || {
+                #[cfg(feature = "net")]
+                {
+                    self.vmr.dhcp_client
+                }
+                #[cfg(not(feature = "net"))]
+                {
+                    false
+                }
+            }
+            || self.tsi_port_map.is_some()
+            || matches!(
+                self.vsock_config,
+                VsockConfig::Explicit { tsi_flags } if tsi_flags.tsi_enabled()
+            )
+            || (self.unix_ipc_port_map.is_some()
+                && !matches!(
+                    self.vsock_config,
+                    VsockConfig::Explicit { tsi_flags } if !tsi_flags.tsi_enabled()
+                ))
+    }
+
     fn set_workdir(&mut self, workdir: String) {
         self.workdir = Some(workdir);
     }
@@ -200,6 +284,15 @@ impl ContextConfig {
         });
     }
 
+    #[cfg(feature = "blk")]
+    fn set_os_root(&mut self, device: String, fstype: Option<String>, options: Option<String>) {
+        self.os_root = Some(BlockRootConfig {
+            device,
+            fstype,
+            options,
+        });
+    }
+
     fn get_block_root(&self) -> String {
         #[cfg(feature = "blk")]
         match &self.block_root {
@@ -217,6 +310,33 @@ impl ContextConfig {
         }
         #[cfg(not(feature = "blk"))]
         "".to_string()
+    }
+
+    fn get_os_root_cmdline(&self) -> String {
+        #[cfg(feature = "blk")]
+        match &self.os_root {
+            Some(os_root) => {
+                let mut res = format!("root={}", os_root.device);
+                if let Some(fstype) = &os_root.fstype {
+                    res += &format!(" rootfstype={fstype}");
+                }
+                if let Some(options) = &os_root.options {
+                    res += &format!(" rootflags={options}");
+                }
+                res
+            }
+            None => "".to_string(),
+        }
+        #[cfg(not(feature = "blk"))]
+        "".to_string()
+    }
+
+    fn set_os_init(&mut self, init_path: String) {
+        self.os_init = Some(init_path);
+    }
+
+    fn get_os_init(&self) -> &str {
+        self.os_init.as_deref().unwrap_or(OS_INIT_PATH)
     }
 
     fn set_env(&mut self, env: String) {
@@ -332,6 +452,56 @@ impl ContextConfig {
 
     fn set_vmm_gid(&mut self, vmm_gid: libc::gid_t) {
         self.vmm_gid = Some(vmm_gid);
+    }
+}
+
+fn build_workload_kernel_cmdline(ctx_cfg: &ContextConfig) -> KernelCmdlineConfig {
+    KernelCmdlineConfig {
+        prolog: Some(format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}")),
+        krun_env: Some(format!(
+            " {} {} {} {} {}",
+            ctx_cfg.get_exec_path(),
+            ctx_cfg.get_workdir(),
+            ctx_cfg.get_block_root(),
+            ctx_cfg.get_rlimits(),
+            ctx_cfg.get_env(),
+        )),
+        epilog: Some(format!(" -- {}", ctx_cfg.get_args())),
+    }
+}
+
+fn default_os_kernel_console(ctx_cfg: &ContextConfig) -> &'static str {
+    if !ctx_cfg.vmr.serial_consoles.is_empty() {
+        DEFAULT_SERIAL_KERNEL_CONSOLE
+    } else {
+        "hvc0"
+    }
+}
+
+fn build_os_kernel_cmdline(ctx_cfg: &ContextConfig) -> KernelCmdlineConfig {
+    let console = ctx_cfg
+        .vmr
+        .kernel_console
+        .as_deref()
+        .unwrap_or_else(|| default_os_kernel_console(ctx_cfg));
+
+    let mut generated = ctx_cfg.get_os_root_cmdline();
+    if !generated.is_empty() {
+        generated.push(' ');
+    }
+    generated.push_str(&format!("init={} console={console}", ctx_cfg.get_os_init()));
+
+    KernelCmdlineConfig {
+        prolog: Some(OS_KERNEL_CMDLINE.to_string()),
+        krun_env: Some(format!(" {generated}")),
+        epilog: None,
+    }
+}
+
+fn build_kernel_cmdline(ctx_cfg: &ContextConfig) -> KernelCmdlineConfig {
+    match ctx_cfg.boot_mode {
+        BootMode::Workload => build_workload_kernel_cmdline(ctx_cfg),
+        BootMode::Os => build_os_kernel_cmdline(ctx_cfg),
     }
 }
 
@@ -576,6 +746,66 @@ pub extern "C" fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -
     KRUN_SUCCESS
 }
 
+/// Enable runtime memory resizing via the virtio-balloon device.
+///
+/// Must be called before `krun_start_enter()`. The VM boots with the RAM
+/// configured by `krun_set_vm_config` as a fixed ceiling; the balloon starts
+/// inflated so that the guest's usable memory equals `initial_mib`, and can
+/// later be resized in the range [`min_mib`, ceiling] by sending commands to
+/// the Unix socket created at `control_socket_path`.
+///
+/// `min_mib` floors how much can be reclaimed; pass 0 to allow reclaiming down
+/// to nothing (not recommended). Returns 0 on success, negative errno on error.
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(not(feature = "tee"))]
+pub unsafe extern "C" fn krun_set_balloon(
+    ctx_id: u32,
+    initial_mib: u32,
+    min_mib: u32,
+    control_socket_path: *const c_char,
+) -> i32 {
+    use devices::virtio::mib_to_pages;
+
+    let socket_path = if control_socket_path.is_null() {
+        None
+    } else {
+        match CStr::from_ptr(control_socket_path).to_str() {
+            Ok(p) => Some(PathBuf::from(p)),
+            Err(_) => return -libc::EINVAL,
+        }
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            let ceiling_mib = match cfg.vmr.vm_config().mem_size_mib {
+                Some(mib) => mib as u32,
+                None => {
+                    error!("krun_set_balloon requires krun_set_vm_config to be called first");
+                    return -libc::EINVAL;
+                }
+            };
+            if initial_mib > ceiling_mib || min_mib > ceiling_mib {
+                error!(
+                    "krun_set_balloon: initial_mib ({initial_mib}) and min_mib ({min_mib}) \
+                     must not exceed the configured RAM ceiling ({ceiling_mib} MiB)"
+                );
+                return -libc::EINVAL;
+            }
+            // Start inflated to (ceiling - initial); allow reclaim up to (ceiling - min).
+            cfg.vmr.balloon = BalloonResize {
+                initial_pages: mib_to_pages(ceiling_mib.saturating_sub(initial_mib)),
+                max_pages: mib_to_pages(ceiling_mib.saturating_sub(min_mib)),
+            };
+            cfg.balloon_control_socket = socket_path;
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 #[cfg(not(feature = "tee"))]
@@ -591,6 +821,10 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
+            if cfg.is_os_mode() {
+                error!("krun_set_root is not valid in OS mode");
+                return -libc::EINVAL;
+            }
             cfg.vmr.add_fs_device(FsDeviceConfig {
                 fs_id,
                 shared_dir,
@@ -664,6 +898,10 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
+            if cfg.is_os_mode() && tag == "/dev/root" {
+                error!("root virtio-fs mounts are not valid in OS mode");
+                return -libc::EINVAL;
+            }
             cfg.vmr.add_fs_device(FsDeviceConfig {
                 fs_id: tag.to_string(),
                 shared_dir: path.to_string(),
@@ -994,6 +1232,10 @@ pub unsafe extern "C" fn krun_add_net_unixstream(
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
+            if cfg.is_os_mode() && enable_dhcp_client {
+                error!("NET_FLAG_DHCP_CLIENT is not valid in OS mode");
+                return -libc::EINVAL;
+            }
             create_virtio_net(cfg, backend, mac, features);
             if enable_dhcp_client {
                 cfg.vmr.dhcp_client = true;
@@ -1055,6 +1297,10 @@ pub unsafe extern "C" fn krun_add_net_unixgram(
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
+            if cfg.is_os_mode() && enable_dhcp_client {
+                error!("NET_FLAG_DHCP_CLIENT is not valid in OS mode");
+                return -libc::EINVAL;
+            }
             create_virtio_net(cfg, backend, mac, features);
             if enable_dhcp_client {
                 cfg.vmr.dhcp_client = true;
@@ -1107,6 +1353,10 @@ pub unsafe extern "C" fn krun_add_net_tap(
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
+            if cfg.is_os_mode() && enable_dhcp_client {
+                error!("NET_FLAG_DHCP_CLIENT is not valid in OS mode");
+                return -libc::EINVAL;
+            }
             create_virtio_net(cfg, VirtioNetBackend::Tap(tap_name), mac, features);
             if enable_dhcp_client {
                 cfg.vmr.dhcp_client = true;
@@ -1240,6 +1490,10 @@ pub unsafe extern "C" fn krun_set_port_map(ctx_id: u32, c_port_map: *const *cons
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
+            if cfg.is_os_mode() {
+                error!("TSI port maps are not valid in OS mode");
+                return -libc::EINVAL;
+            }
             if cfg.vsock_config == VsockConfig::Disabled {
                 return -libc::ENODEV;
             }
@@ -1279,7 +1533,12 @@ pub unsafe extern "C" fn krun_set_rlimits(ctx_id: u32, c_rlimits: *const *const 
 
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
-            ctx_cfg.get_mut().set_rlimits(rlimits);
+            let cfg = ctx_cfg.get_mut();
+            if cfg.is_os_mode() {
+                error!("krun_set_rlimits is not valid in OS mode");
+                return -libc::EINVAL;
+            }
+            cfg.set_rlimits(rlimits);
         }
         Entry::Vacant(_) => return -libc::ENOENT,
     }
@@ -1297,7 +1556,12 @@ pub unsafe extern "C" fn krun_set_workdir(ctx_id: u32, c_workdir_path: *const c_
 
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
-            ctx_cfg.get_mut().set_workdir(workdir_path.to_string());
+            let cfg = ctx_cfg.get_mut();
+            if cfg.is_os_mode() {
+                error!("krun_set_workdir is not valid in OS mode");
+                return -libc::EINVAL;
+            }
+            cfg.set_workdir(workdir_path.to_string());
         }
         Entry::Vacant(_) => return -libc::ENOENT,
     }
@@ -1368,6 +1632,10 @@ pub unsafe extern "C" fn krun_set_exec(
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
+            if cfg.is_os_mode() {
+                error!("krun_set_exec is not valid in OS mode");
+                return -libc::EINVAL;
+            }
             cfg.set_exec_path(exec_path.to_string());
             cfg.set_env(env);
             cfg.set_args(args);
@@ -1400,6 +1668,10 @@ pub unsafe extern "C" fn krun_set_env(ctx_id: u32, c_envp: *const *const c_char)
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
+            if cfg.is_os_mode() {
+                error!("krun_set_env is not valid in OS mode");
+                return -libc::EINVAL;
+            }
             cfg.set_env(env);
         }
         Entry::Vacant(_) => return -libc::ENOENT,
@@ -1469,6 +1741,15 @@ pub unsafe extern "C" fn krun_add_vsock_port2(
             let cfg = ctx_cfg.get_mut();
             if cfg.vsock_config == VsockConfig::Disabled {
                 return -libc::ENODEV;
+            }
+            if cfg.is_os_mode()
+                && !matches!(
+                    cfg.vsock_config,
+                    VsockConfig::Explicit { tsi_flags } if !tsi_flags.tsi_enabled()
+                )
+            {
+                error!("OS mode vsock ports require an explicit non-TSI vsock device");
+                return -libc::EINVAL;
             }
             cfg.add_vsock_port(port, filepath, listen);
         }
@@ -2225,6 +2506,139 @@ pub unsafe extern "C" fn krun_set_kernel(
     KRUN_SUCCESS
 }
 
+#[no_mangle]
+pub extern "C" fn krun_set_os_mode(ctx_id: u32) -> i32 {
+    if cfg!(feature = "tee") || cfg!(feature = "aws-nitro") {
+        error!("OS mode is not supported in TEE or AWS Nitro builds");
+        return -libc::EOPNOTSUPP;
+    }
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            if cfg.has_workload_config() {
+                error!("OS mode cannot be enabled after workload configuration");
+                return -libc::EINVAL;
+            }
+            if let Some(console) = cfg.vmr.kernel_console.as_deref() {
+                if !is_single_kernel_cmdline_token(console) {
+                    error!("OS mode kernel console must be a single kernel command-line token");
+                    return -libc::EINVAL;
+                }
+            }
+            cfg.set_os_mode();
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+fn is_single_kernel_cmdline_token(value: &str) -> bool {
+    !value.is_empty() && !value.bytes().any(|b| b.is_ascii_whitespace())
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_set_os_init(ctx_id: u32, c_init_path: *const c_char) -> i32 {
+    if c_init_path.is_null() {
+        return -libc::EINVAL;
+    }
+
+    let init_path = match CStr::from_ptr(c_init_path).to_str() {
+        Ok(init_path) if is_single_kernel_cmdline_token(init_path) => init_path.to_string(),
+        Ok(_) => return -libc::EINVAL,
+        Err(e) => {
+            error!("Error parsing OS init path: {e:?}");
+            return -libc::EINVAL;
+        }
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            if !cfg.is_os_mode() {
+                error!("krun_set_os_init requires OS mode");
+                return -libc::EINVAL;
+            }
+            cfg.set_os_init(init_path);
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+#[cfg(feature = "blk")]
+unsafe fn parse_optional_root_arg(
+    arg: *const c_char,
+    treat_auto_as_none: bool,
+) -> Result<Option<String>, i32> {
+    if arg.is_null() {
+        return Ok(None);
+    }
+
+    match CStr::from_ptr(arg).to_str() {
+        Ok(value) if treat_auto_as_none && value == "auto" => Ok(None),
+        Ok(value) if is_single_kernel_cmdline_token(value) => Ok(Some(value.to_string())),
+        Ok(_) => Err(-libc::EINVAL),
+        Err(e) => {
+            error!("Error parsing root argument: {e:?}");
+            Err(-libc::EINVAL)
+        }
+    }
+}
+
+#[cfg(feature = "blk")]
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_set_os_root(
+    ctx_id: u32,
+    c_device: *const c_char,
+    c_fstype: *const c_char,
+    c_options: *const c_char,
+) -> i32 {
+    if c_device.is_null() {
+        return -libc::EINVAL;
+    }
+
+    let device = match CStr::from_ptr(c_device).to_str() {
+        Ok(device) if is_single_kernel_cmdline_token(device) => device.to_string(),
+        Ok(_) => return -libc::EINVAL,
+        Err(e) => {
+            error!("Error parsing OS root device path: {e:?}");
+            return -libc::EINVAL;
+        }
+    };
+
+    let fstype = match parse_optional_root_arg(c_fstype, true) {
+        Ok(fstype) => fstype,
+        Err(e) => return e,
+    };
+    let options = match parse_optional_root_arg(c_options, false) {
+        Ok(options) => options,
+        Err(e) => return e,
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let ctx_cfg = ctx_cfg.get_mut();
+            if !ctx_cfg.is_os_mode() {
+                error!("krun_set_os_root requires OS mode");
+                return -libc::EINVAL;
+            }
+            if ctx_cfg.get_block_cfg().is_empty() {
+                error!("OS root requires at least one configured block device");
+                return -libc::EINVAL;
+            }
+            ctx_cfg.set_os_root(device, fstype, options);
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    };
+
+    KRUN_SUCCESS
+}
+
 #[cfg(not(feature = "tee"))]
 #[allow(clippy::format_collect)]
 #[allow(clippy::missing_safety_doc)]
@@ -2369,6 +2783,11 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
         Entry::Occupied(mut ctx_cfg) => {
             let ctx_cfg = ctx_cfg.get_mut();
 
+            if ctx_cfg.is_os_mode() {
+                error!("krun_set_root_disk_remount is not valid in OS mode");
+                return -libc::EINVAL;
+            }
+
             if ctx_cfg.vmr.fs.iter().any(|fs| fs.fs_id == "/dev/root") {
                 error!("Root filesystem already configured");
                 return -libc::EINVAL;
@@ -2449,6 +2868,10 @@ pub extern "C" fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
+            if cfg.is_os_mode() && tsi_flags.tsi_enabled() {
+                error!("TSI hijacking is not valid in OS mode");
+                return -libc::EINVAL;
+            }
             if cfg.vsock_config != VsockConfig::Disabled {
                 return -libc::EEXIST;
             }
@@ -2612,6 +3035,10 @@ pub unsafe extern "C" fn krun_add_serial_console_default(
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 pub unsafe extern "C" fn krun_set_kernel_console(ctx_id: u32, console_id: *const c_char) -> i32 {
+    if console_id.is_null() {
+        return -libc::EINVAL;
+    }
+
     let console_id = match CStr::from_ptr(console_id).to_str() {
         Ok(id) => id.to_string(),
         Err(_) => return -libc::EINVAL,
@@ -2619,12 +3046,117 @@ pub unsafe extern "C" fn krun_set_kernel_console(ctx_id: u32, console_id: *const
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
+            if cfg.is_os_mode() && !is_single_kernel_cmdline_token(&console_id) {
+                error!("krun_set_kernel_console requires a single token in OS mode");
+                return -libc::EINVAL;
+            }
             cfg.vmr.kernel_console = Some(console_id);
         }
         Entry::Vacant(_) => return -libc::ENOENT,
     }
 
     KRUN_SUCCESS
+}
+
+/// Spawns a background thread that serves a line-based control protocol on a
+/// Unix socket for adjusting the guest's memory at runtime via the balloon.
+///
+/// Commands (newline-terminated):
+///   `target-mib <n>`     set guest usable memory to n MiB (clamped to range)
+///   `reclaim-pages <n>`  set the raw 4KiB-page reclaim target
+///   `ceiling`            report the boot RAM ceiling in MiB
+///   `ping`               liveness check
+#[cfg(not(feature = "tee"))]
+fn spawn_balloon_control_listener(
+    socket_path: PathBuf,
+    ceiling_mib: u32,
+    control: devices::virtio::BalloonControl,
+) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    // Drop any stale socket left by a previous run before binding.
+    let _ = std::fs::remove_file(&socket_path);
+
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!("balloon: failed to bind control socket {socket_path:?}: {e}");
+            return;
+        }
+    };
+
+    info!(
+        "balloon: resize control socket at {socket_path:?} (ceiling {ceiling_mib} MiB, \
+         max reclaim {} MiB)",
+        control.max_pages() / 256
+    );
+
+    std::thread::Builder::new()
+        .name("balloon-control".into())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                let stream = match stream {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        warn!("balloon: control accept error: {e}");
+                        continue;
+                    }
+                };
+                let mut writer = match stream.try_clone() {
+                    Ok(writer) => writer,
+                    Err(e) => {
+                        warn!("balloon: control stream clone error: {e}");
+                        continue;
+                    }
+                };
+                let reader = BufReader::new(stream);
+                for line in reader.lines() {
+                    let line = match line {
+                        Ok(line) => line,
+                        Err(_) => break,
+                    };
+                    let response = handle_balloon_command(line.trim(), ceiling_mib, &control);
+                    if writeln!(writer, "{response}").is_err() {
+                        break;
+                    }
+                }
+            }
+        })
+        .unwrap_or_else(|e| {
+            error!("balloon: failed to spawn control listener thread: {e}");
+            panic!("balloon control listener thread spawn failed");
+        });
+}
+
+#[cfg(not(feature = "tee"))]
+fn handle_balloon_command(
+    line: &str,
+    ceiling_mib: u32,
+    control: &devices::virtio::BalloonControl,
+) -> String {
+    let mut parts = line.split_whitespace();
+    match parts.next() {
+        Some("ping") => "ok".to_string(),
+        Some("ceiling") => format!("ok ceiling-mib={ceiling_mib}"),
+        Some("target-mib") => match parts.next().and_then(|v| v.parse::<u32>().ok()) {
+            Some(mib) => {
+                let reclaimed_pages = control.set_target_mib(mib, ceiling_mib);
+                let usable_mib = ceiling_mib.saturating_sub(reclaimed_pages / 256);
+                format!("ok target-mib={usable_mib} reclaimed-pages={reclaimed_pages}")
+            }
+            None => "error usage: target-mib <mib>".to_string(),
+        },
+        Some("reclaim-pages") => match parts.next().and_then(|v| v.parse::<u32>().ok()) {
+            Some(pages) => {
+                let applied = control.set_target_pages(pages);
+                format!("ok reclaimed-pages={applied}")
+            }
+            None => "error usage: reclaim-pages <pages>".to_string(),
+        },
+        Some(other) => format!("error unknown command: {other}"),
+        None => "error empty command".to_string(),
+    }
 }
 
 #[no_mangle]
@@ -2654,6 +3186,33 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         Some(ctx_cfg) => ctx_cfg,
         None => return -libc::ENOENT,
     };
+
+    if ctx_cfg.is_os_mode() {
+        #[cfg(feature = "blk")]
+        if ctx_cfg.os_root.is_none() {
+            error!("OS mode requires krun_set_os_root");
+            return -libc::EINVAL;
+        }
+        #[cfg(not(feature = "blk"))]
+        {
+            error!("OS mode requires block device support");
+            return -libc::EINVAL;
+        }
+
+        if ctx_cfg.vmr.firmware_config.is_some() {
+            error!("OS mode currently requires direct kernel boot, not firmware");
+            return -libc::EINVAL;
+        }
+
+        if ctx_cfg.vmr.external_kernel.is_none() && ctx_cfg.vmr.kernel_bundle.is_none() {
+            error!("OS mode requires a kernel configured with krun_set_kernel");
+            return -libc::EINVAL;
+        }
+
+        if matches!(ctx_cfg.vsock_config, VsockConfig::Implicit) {
+            ctx_cfg.vsock_config = VsockConfig::Disabled;
+        }
+    }
 
     if ctx_cfg.vmr.external_kernel.is_none()
         && ctx_cfg.vmr.kernel_bundle.is_none()
@@ -2695,18 +3254,14 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         return -libc::EINVAL;
     }
 
-    let kernel_cmdline = KernelCmdlineConfig {
-        prolog: Some(format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}")),
-        krun_env: Some(format!(
-            " {} {} {} {} {}",
-            ctx_cfg.get_exec_path(),
-            ctx_cfg.get_workdir(),
-            ctx_cfg.get_block_root(),
-            ctx_cfg.get_rlimits(),
-            ctx_cfg.get_env(),
-        )),
-        epilog: Some(format!(" -- {}", ctx_cfg.get_args())),
-    };
+    debug!("Selected boot mode: {:?}", ctx_cfg.boot_mode);
+    let kernel_cmdline = build_kernel_cmdline(&ctx_cfg);
+    if ctx_cfg.is_os_mode() {
+        debug!(
+            "OS mode kernel command line fragments: prolog={:?}, append={:?}",
+            kernel_cmdline.prolog, kernel_cmdline.krun_env
+        );
+    }
 
     if ctx_cfg.vmr.set_kernel_cmdline(kernel_cmdline).is_err() {
         return -libc::EINVAL;
@@ -2796,6 +3351,11 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
 
     let (sender, _receiver) = unbounded();
 
+    // Captured before build_microvm so we can wire up the resize control
+    // socket once the (resize-capable) balloon device exists.
+    let balloon_socket = ctx_cfg.balloon_control_socket.take();
+    let balloon_ceiling_mib = ctx_cfg.vmr.vm_config().mem_size_mib.unwrap_or(0) as u32;
+
     let _vmm = match vmm::builder::build_microvm(
         &ctx_cfg.vmr,
         &mut event_manager,
@@ -2808,6 +3368,18 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             return -libc::EINVAL;
         }
     };
+
+    #[cfg(not(feature = "tee"))]
+    if let Some(socket_path) = balloon_socket {
+        match _vmm.lock().unwrap().balloon_control() {
+            Some(control) => {
+                spawn_balloon_control_listener(socket_path, balloon_ceiling_mib, control)
+            }
+            None => warn!(
+                "balloon control socket configured but no resize-capable balloon was attached"
+            ),
+        }
+    }
 
     #[cfg(target_os = "macos")]
     if ctx_cfg.gpu_virgl_flags.is_some() {
@@ -2852,5 +3424,627 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
 
             -libc::EINVAL
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use once_cell::sync::Lazy;
+    use std::ffi::CString;
+
+    static TEST_CTX_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    #[test]
+    fn workload_cmdline_matches_existing_contract() {
+        let mut cfg = ContextConfig::default();
+        cfg.set_exec_path("/bin/sh".to_string());
+        cfg.set_workdir("/work".to_string());
+        cfg.set_rlimits("\"NOFILE=1:2\"".to_string());
+        cfg.set_env(" FOO=\"bar\"".to_string());
+        cfg.set_args("\"-c\" \"true\"".to_string());
+
+        #[cfg(feature = "blk")]
+        cfg.set_block_root(
+            "/dev/vda1".to_string(),
+            Some("ext4".to_string()),
+            Some("rw".to_string()),
+        );
+
+        let cmdline = build_kernel_cmdline(&cfg);
+
+        let expected_prolog = format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}");
+        assert_eq!(cmdline.prolog.as_deref(), Some(expected_prolog.as_str()));
+
+        let env = cmdline.krun_env.unwrap();
+        assert!(env.contains("KRUN_INIT=/bin/sh"));
+        assert!(env.contains("KRUN_WORKDIR=/work"));
+        assert!(env.contains("KRUN_RLIMITS=\"NOFILE=1:2\""));
+        assert!(env.contains("FOO=\"bar\""));
+        #[cfg(feature = "blk")]
+        {
+            assert!(env.contains("KRUN_BLOCK_ROOT_DEVICE=/dev/vda1"));
+            assert!(env.contains("KRUN_BLOCK_ROOT_FSTYPE=ext4"));
+            assert!(env.contains("KRUN_BLOCK_ROOT_OPTIONS=rw"));
+        }
+
+        assert_eq!(cmdline.epilog.as_deref(), Some(" -- \"-c\" \"true\""));
+    }
+
+    #[test]
+    fn os_cmdline_omits_workload_handoff() {
+        let mut cfg = ContextConfig::default();
+        cfg.set_os_mode();
+
+        #[cfg(feature = "blk")]
+        cfg.set_os_root(
+            "/dev/vda1".to_string(),
+            Some("ext4".to_string()),
+            Some("rw,noatime".to_string()),
+        );
+
+        let cmdline = build_kernel_cmdline(&cfg);
+
+        assert_eq!(cmdline.prolog.as_deref(), Some(OS_KERNEL_CMDLINE));
+        assert!(cmdline.epilog.is_none());
+
+        let generated = cmdline.krun_env.unwrap();
+        assert!(generated.contains(&format!("init={OS_INIT_PATH}")));
+        assert!(generated.contains("console=hvc0"));
+        assert!(!generated.contains("init=/init.krun"));
+        assert!(!generated.contains("KRUN_INIT"));
+        assert!(!generated.contains("KRUN_WORKDIR"));
+        assert!(!generated.contains("KRUN_RLIMITS"));
+
+        #[cfg(feature = "blk")]
+        {
+            assert!(generated.contains("root=/dev/vda1"));
+            assert!(generated.contains("rootfstype=ext4"));
+            assert!(generated.contains("rootflags=rw,noatime"));
+        }
+    }
+
+    #[test]
+    fn os_cmdline_prefers_explicit_kernel_console() {
+        let mut cfg = ContextConfig::default();
+        cfg.set_os_mode();
+        cfg.vmr.kernel_console = Some("ttyCUSTOM0".to_string());
+
+        let cmdline = build_kernel_cmdline(&cfg);
+        assert!(cmdline.krun_env.unwrap().contains("console=ttyCUSTOM0"));
+    }
+
+    #[test]
+    fn os_cmdline_uses_configured_init_path() {
+        let mut cfg = ContextConfig::default();
+        cfg.set_os_mode();
+        cfg.set_os_init("/bin/busybox".to_string());
+
+        let cmdline = build_kernel_cmdline(&cfg);
+        let append = cmdline.krun_env.unwrap();
+        assert!(append.contains("init=/bin/busybox"));
+        assert!(!append.contains("init=/sbin/init"));
+    }
+
+    #[test]
+    fn os_cmdline_places_generated_args_in_append_fragment() {
+        let mut cfg = ContextConfig::default();
+        cfg.set_os_mode();
+
+        #[cfg(feature = "blk")]
+        cfg.set_os_root("/dev/vda1".to_string(), Some("ext4".to_string()), None);
+
+        let cmdline = build_kernel_cmdline(&cfg);
+
+        assert_eq!(cmdline.prolog.as_deref(), Some(OS_KERNEL_CMDLINE));
+        let append = cmdline.krun_env.unwrap();
+        #[cfg(feature = "blk")]
+        assert!(append.contains("root=/dev/vda1"));
+        assert!(append.contains("init=/sbin/init"));
+        assert!(append.contains("console=hvc0"));
+    }
+
+    #[test]
+    fn os_cmdline_uses_arch_serial_console_when_serial_is_configured() {
+        let mut cfg = ContextConfig::default();
+        cfg.set_os_mode();
+        cfg.vmr.serial_consoles.push(SerialConsoleConfig {
+            input_fd: 0,
+            output_fd: 1,
+        });
+
+        let cmdline = build_kernel_cmdline(&cfg);
+        assert!(cmdline
+            .krun_env
+            .unwrap()
+            .contains(&format!("console={DEFAULT_SERIAL_KERNEL_CONSOLE}")));
+    }
+
+    #[test]
+    fn os_mode_rejects_unknown_context() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        assert_eq!(krun_set_os_mode(u32::MAX), -libc::ENOENT);
+    }
+
+    #[test]
+    fn os_mode_rejects_later_workload_exec() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+
+        let exec = CString::new("/bin/true").unwrap();
+        let ret =
+            unsafe { krun_set_exec(ctx_id, exec.as_ptr(), std::ptr::null(), std::ptr::null()) };
+        assert_eq!(ret, -libc::EINVAL);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn os_mode_rejects_existing_invalid_kernel_console() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let console = CString::new("ttyS0 panic=1").unwrap();
+
+        assert_eq!(
+            unsafe { krun_set_kernel_console(ctx_id, console.as_ptr()) },
+            KRUN_SUCCESS
+        );
+        assert_eq!(krun_set_os_mode(ctx_id), -libc::EINVAL);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn os_mode_rejects_later_invalid_kernel_console() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let console = CString::new("ttyS0 panic=1").unwrap();
+
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+        assert_eq!(
+            unsafe { krun_set_kernel_console(ctx_id, console.as_ptr()) },
+            -libc::EINVAL
+        );
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn os_mode_rejects_later_tsi_port_map() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let port = CString::new("1000:2000").unwrap();
+        let mut port_map = vec![std::ptr::null(); MAX_ARGS];
+        port_map[0] = port.as_ptr();
+
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+        assert_eq!(
+            unsafe { krun_set_port_map(ctx_id, port_map.as_ptr()) },
+            -libc::EINVAL
+        );
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn os_mode_rejects_existing_tsi_port_map() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let port = CString::new("1000:2000").unwrap();
+        let mut port_map = vec![std::ptr::null(); MAX_ARGS];
+        port_map[0] = port.as_ptr();
+
+        assert_eq!(
+            unsafe { krun_set_port_map(ctx_id, port_map.as_ptr()) },
+            KRUN_SUCCESS
+        );
+        assert_eq!(krun_set_os_mode(ctx_id), -libc::EINVAL);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn os_mode_rejects_later_tsi_hijack_vsock() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+        assert_eq!(
+            krun_add_vsock(ctx_id, TsiFlags::HIJACK_INET.bits()),
+            -libc::EINVAL
+        );
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn os_mode_rejects_existing_tsi_hijack_vsock() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+
+        assert_eq!(krun_disable_implicit_vsock(ctx_id), KRUN_SUCCESS);
+        assert_eq!(
+            krun_add_vsock(ctx_id, TsiFlags::HIJACK_INET.bits()),
+            KRUN_SUCCESS
+        );
+        assert_eq!(krun_set_os_mode(ctx_id), -libc::EINVAL);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn os_mode_allows_explicit_vsock_without_tsi() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+
+        assert_eq!(krun_disable_implicit_vsock(ctx_id), KRUN_SUCCESS);
+        assert_eq!(
+            krun_add_vsock(ctx_id, TsiFlags::empty().bits()),
+            KRUN_SUCCESS
+        );
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn os_mode_rejects_later_implicit_vsock_port() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let path = CString::new("/tmp/krun-osmode.sock").unwrap();
+
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+        assert_eq!(
+            unsafe { krun_add_vsock_port(ctx_id, 1024, path.as_ptr()) },
+            -libc::EINVAL
+        );
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn os_mode_rejects_existing_implicit_vsock_port() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let path = CString::new("/tmp/krun-osmode.sock").unwrap();
+
+        assert_eq!(
+            unsafe { krun_add_vsock_port(ctx_id, 1024, path.as_ptr()) },
+            KRUN_SUCCESS
+        );
+        assert_eq!(krun_set_os_mode(ctx_id), -libc::EINVAL);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn os_mode_allows_later_explicit_plain_vsock_port() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let path = CString::new("/tmp/krun-osmode.sock").unwrap();
+
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+        assert_eq!(krun_disable_implicit_vsock(ctx_id), KRUN_SUCCESS);
+        assert_eq!(
+            krun_add_vsock(ctx_id, TsiFlags::empty().bits()),
+            KRUN_SUCCESS
+        );
+        assert_eq!(
+            unsafe { krun_add_vsock_port(ctx_id, 1024, path.as_ptr()) },
+            KRUN_SUCCESS
+        );
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn os_mode_allows_existing_explicit_plain_vsock_port() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let path = CString::new("/tmp/krun-osmode.sock").unwrap();
+
+        assert_eq!(krun_disable_implicit_vsock(ctx_id), KRUN_SUCCESS);
+        assert_eq!(
+            krun_add_vsock(ctx_id, TsiFlags::empty().bits()),
+            KRUN_SUCCESS
+        );
+        assert_eq!(
+            unsafe { krun_add_vsock_port(ctx_id, 1024, path.as_ptr()) },
+            KRUN_SUCCESS
+        );
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn os_mode_rejects_later_virtiofs_root() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+
+        let root = CString::new("/tmp").unwrap();
+        let ret = unsafe { krun_set_root(ctx_id, root.as_ptr()) };
+        assert_eq!(ret, -libc::EINVAL);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn os_mode_rejects_existing_virtiofs_root() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+
+        let root = CString::new("/tmp").unwrap();
+        assert_eq!(
+            unsafe { krun_set_root(ctx_id, root.as_ptr()) },
+            KRUN_SUCCESS
+        );
+        assert_eq!(krun_set_os_mode(ctx_id), -libc::EINVAL);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn os_mode_rejects_later_root_virtiofs_tag() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+
+        let tag = CString::new("/dev/root").unwrap();
+        let path = CString::new("/tmp").unwrap();
+
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+        let ret = unsafe { krun_add_virtiofs(ctx_id, tag.as_ptr(), path.as_ptr()) };
+        assert_eq!(ret, -libc::EINVAL);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn os_mode_allows_later_non_root_virtiofs_tag() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+
+        let tag = CString::new("shared").unwrap();
+        let path = CString::new("/tmp").unwrap();
+
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+        let ret = unsafe { krun_add_virtiofs(ctx_id, tag.as_ptr(), path.as_ptr()) };
+        assert_eq!(ret, KRUN_SUCCESS);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(feature = "blk")]
+    #[test]
+    fn os_root_requires_os_mode() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let device = CString::new("/dev/vda1").unwrap();
+
+        let ret = unsafe {
+            krun_set_os_root(ctx_id, device.as_ptr(), std::ptr::null(), std::ptr::null())
+        };
+        assert_eq!(ret, -libc::EINVAL);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(feature = "blk")]
+    #[test]
+    fn os_root_rejects_missing_block_device() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let device = CString::new("/dev/vda1").unwrap();
+
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+        let ret = unsafe {
+            krun_set_os_root(ctx_id, device.as_ptr(), std::ptr::null(), std::ptr::null())
+        };
+        assert_eq!(ret, -libc::EINVAL);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(feature = "blk")]
+    #[test]
+    fn os_root_accepts_auto_fstype_and_null_options() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let disk = CString::new("/tmp/root.raw").unwrap();
+        let device = CString::new("/dev/vda1").unwrap();
+        let fstype = CString::new("auto").unwrap();
+
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+        assert_eq!(
+            unsafe { krun_set_root_disk(ctx_id, disk.as_ptr()) },
+            KRUN_SUCCESS
+        );
+        let ret =
+            unsafe { krun_set_os_root(ctx_id, device.as_ptr(), fstype.as_ptr(), std::ptr::null()) };
+        assert_eq!(ret, KRUN_SUCCESS);
+
+        let ctx = CTX_MAP.lock().unwrap();
+        let cfg = ctx.get(&ctx_id).unwrap();
+        assert_eq!(cfg.get_os_root_cmdline(), "root=/dev/vda1");
+        drop(ctx);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(feature = "blk")]
+    #[test]
+    fn os_root_rejects_empty_device() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let disk = CString::new("/tmp/root.raw").unwrap();
+        let device = CString::new("").unwrap();
+
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+        assert_eq!(
+            unsafe { krun_set_root_disk(ctx_id, disk.as_ptr()) },
+            KRUN_SUCCESS
+        );
+        let ret = unsafe {
+            krun_set_os_root(ctx_id, device.as_ptr(), std::ptr::null(), std::ptr::null())
+        };
+        assert_eq!(ret, -libc::EINVAL);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(feature = "blk")]
+    #[test]
+    fn os_root_rejects_whitespace_in_device() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let disk = CString::new("/tmp/root.raw").unwrap();
+        let device = CString::new("/dev/vda1 root=/dev/vdb1").unwrap();
+
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+        assert_eq!(
+            unsafe { krun_set_root_disk(ctx_id, disk.as_ptr()) },
+            KRUN_SUCCESS
+        );
+        let ret = unsafe {
+            krun_set_os_root(ctx_id, device.as_ptr(), std::ptr::null(), std::ptr::null())
+        };
+        assert_eq!(ret, -libc::EINVAL);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(feature = "blk")]
+    #[test]
+    fn os_root_rejects_empty_fstype() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let disk = CString::new("/tmp/root.raw").unwrap();
+        let device = CString::new("/dev/vda1").unwrap();
+        let fstype = CString::new("").unwrap();
+
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+        assert_eq!(
+            unsafe { krun_set_root_disk(ctx_id, disk.as_ptr()) },
+            KRUN_SUCCESS
+        );
+        let ret =
+            unsafe { krun_set_os_root(ctx_id, device.as_ptr(), fstype.as_ptr(), std::ptr::null()) };
+        assert_eq!(ret, -libc::EINVAL);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(feature = "blk")]
+    #[test]
+    fn os_root_rejects_whitespace_in_options() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let disk = CString::new("/tmp/root.raw").unwrap();
+        let device = CString::new("/dev/vda1").unwrap();
+        let options = CString::new("rw quiet").unwrap();
+
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+        assert_eq!(
+            unsafe { krun_set_root_disk(ctx_id, disk.as_ptr()) },
+            KRUN_SUCCESS
+        );
+        let ret = unsafe {
+            krun_set_os_root(ctx_id, device.as_ptr(), std::ptr::null(), options.as_ptr())
+        };
+        assert_eq!(ret, -libc::EINVAL);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn os_init_requires_os_mode() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let init_path = CString::new("/bin/init").unwrap();
+
+        let ret = unsafe { krun_set_os_init(ctx_id, init_path.as_ptr()) };
+        assert_eq!(ret, -libc::EINVAL);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn os_init_rejects_empty_path() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let init_path = CString::new("").unwrap();
+
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+        let ret = unsafe { krun_set_os_init(ctx_id, init_path.as_ptr()) };
+        assert_eq!(ret, -libc::EINVAL);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn os_init_rejects_whitespace_path() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let init_path = CString::new("/sbin/init panic=1").unwrap();
+
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+        let ret = unsafe { krun_set_os_init(ctx_id, init_path.as_ptr()) };
+        assert_eq!(ret, -libc::EINVAL);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn os_mode_rejects_embedded_dhcp_flag() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let path = CString::new("/tmp/passt.sock").unwrap();
+        let mac = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
+
+        assert_eq!(krun_set_os_mode(ctx_id), KRUN_SUCCESS);
+        let ret = unsafe {
+            krun_add_net_unixstream(
+                ctx_id,
+                path.as_ptr(),
+                -1,
+                mac.as_ptr(),
+                NET_COMPAT_FEATURES,
+                NET_FLAG_DHCP_CLIENT,
+            )
+        };
+        assert_eq!(ret, -libc::EINVAL);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn os_mode_rejects_existing_embedded_dhcp_flag() {
+        let _guard = TEST_CTX_LOCK.lock().unwrap();
+        let ctx_id = krun_create_ctx() as u32;
+        let path = CString::new("/tmp/passt.sock").unwrap();
+        let mac = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
+
+        let ret = unsafe {
+            krun_add_net_unixstream(
+                ctx_id,
+                path.as_ptr(),
+                -1,
+                mac.as_ptr(),
+                NET_COMPAT_FEATURES,
+                NET_FLAG_DHCP_CLIENT,
+            )
+        };
+        assert_eq!(ret, KRUN_SUCCESS);
+        assert_eq!(krun_set_os_mode(ctx_id), -libc::EINVAL);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
     }
 }
