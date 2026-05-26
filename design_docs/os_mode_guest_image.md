@@ -39,6 +39,41 @@ CONFIG_INET=y
 CONFIG_PACKET=y
 ```
 
+Memory reclaim (virtio-balloon free-page reporting):
+
+```text
+CONFIG_VIRTIO_BALLOON=y
+CONFIG_PAGE_REPORTING=y
+```
+
+libkrun always attaches a virtio-balloon device and advertises
+`VIRTIO_BALLOON_F_REPORTING`; its free-page-reporting queue handler returns
+reported pages to the host with `madvise(MADV_DONTNEED)`. A guest built with
+these two options therefore hands idle pages back automatically, so a long-lived
+VM's host RSS tracks its live working set instead of its high-water mark — the
+density lever in the agent-sandbox design (free-page reporting / #A). Without
+`CONFIG_PAGE_REPORTING` the device still negotiates the feature but the guest
+never reports, so no reclaim happens. These are independent of the optional
+runtime *resize* path (`--control-socket` / `--balloon-initial-mib`), which
+stays available when a higher ceiling is booted.
+
+Shared read-only mounts with DAX (share host page cache across guests):
+
+```text
+CONFIG_VIRTIO_FS=y
+CONFIG_FUSE_FS=y
+CONFIG_FUSE_DAX=y
+CONFIG_DAX=y
+CONFIG_ZONE_DEVICE=y
+```
+
+With a DAX window (`krun_add_virtiofs2/3` `shm_size`, surfaced as os_mode's
+`--virtiofs-dax-size`), a guest maps virtio-fs file pages directly from the host
+page cache rather than copying them into guest RAM. Multiple guests mounting the
+same read-only host directory then share those physical pages while staying
+isolated — the cross-VM sharing lever (virtiofs DAX / #D). Without
+`CONFIG_FUSE_DAX` the mount still works but falls back to per-guest caching.
+
 x86_64 serial additions:
 
 ```text

@@ -32,6 +32,16 @@ const VIRTIO_BALLOON_PAGE_SIZE: usize = 1 << VIRTIO_BALLOON_PFN_SHIFT;
 // Offset of the `actual` field within VirtioBalloonConfig (num_pages is first).
 const CONFIG_ACTUAL_OFFSET: u64 = 4;
 
+// madvise advice for returning relinquished (inflate) and free-page-reported
+// guest pages to the host. Linux reclaims immediately with MADV_DONTNEED, but on
+// macOS MADV_DONTNEED does NOT drop anonymous pages from a process's physical
+// footprint; MADV_FREE_REUSABLE does, so free-page reporting actually shrinks
+// host RSS there.
+#[cfg(target_os = "macos")]
+const RECLAIM_ADVICE: libc::c_int = libc::MADV_FREE_REUSABLE;
+#[cfg(not(target_os = "macos"))]
+const RECLAIM_ADVICE: libc::c_int = libc::MADV_DONTNEED;
+
 // Supported features.
 pub(crate) const AVAIL_FEATURES: u64 = (1 << uapi::VIRTIO_F_VERSION_1 as u64)
     | (1 << uapi::VIRTIO_BALLOON_F_STATS_VQ as u64)
@@ -161,7 +171,7 @@ impl Balloon {
     }
 
     /// Drain a PFN-carrying queue (inflate or deflate). On inflate we return
-    /// the relinquished pages to the host via `madvise(MADV_DONTNEED)`; on
+    /// the relinquished pages to the host via `madvise(RECLAIM_ADVICE)`; on
     /// deflate the guest simply reclaims them, so we only ack the buffers.
     fn process_pfn_queue(&mut self, queue_index: usize, release_to_host: bool) -> bool {
         let mem = match self.device_state {
@@ -201,7 +211,7 @@ impl Balloon {
                             libc::madvise(
                                 host_addr as *mut libc::c_void,
                                 VIRTIO_BALLOON_PAGE_SIZE,
-                                libc::MADV_DONTNEED,
+                                RECLAIM_ADVICE,
                             )
                         };
                     }
@@ -253,7 +263,7 @@ impl Balloon {
                     libc::madvise(
                         host_addr as *mut libc::c_void,
                         desc.len.try_into().unwrap(),
-                        libc::MADV_DONTNEED,
+                        RECLAIM_ADVICE,
                     )
                 };
             }

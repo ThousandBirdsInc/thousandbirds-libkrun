@@ -58,6 +58,7 @@ struct cmdline {
     const char *gvproxy_socket;
     const char *control_socket;
     struct virtiofs_mount virtiofs_mounts[MAX_VIRTIOFS_MOUNTS];
+    uint64_t virtiofs_dax_size;
     uint32_t net_features;
     uint32_t kernel_format;
     uint32_t disk_sync_mode;
@@ -101,6 +102,7 @@ static void print_help(const char *name)
             "  -G, --gvproxy-socket PATH  Connect virtio-net to a gvproxy/vfkit unixgram socket\n"
             "  -V, --virtiofs TAG=PATH    Add a non-root virtio-fs shared directory\n"
             "      --virtiofs-ro TAG=PATH Add a read-only non-root virtio-fs shared directory\n"
+            "      --virtiofs-dax-size NUM  DAX window bytes for virtio-fs mounts (default: 0 = off)\n"
             "      --cpus NUM             Number of guest vCPUs (default: 2)\n"
             "      --memory-mib NUM       Guest RAM in MiB (default: 2048); the resize ceiling\n"
             "      --balloon-initial-mib NUM  Initial guest usable RAM in MiB (enables resize; <= --memory-mib)\n"
@@ -124,6 +126,17 @@ static bool parse_u32(const char *value, uint32_t *out)
         return false;
     }
     *out = (uint32_t)parsed;
+    return true;
+}
+
+static bool parse_u64(const char *value, uint64_t *out)
+{
+    char *end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 0);
+    if (end == value || *end != '\0') {
+        return false;
+    }
+    *out = (uint64_t)parsed;
     return true;
 }
 
@@ -244,6 +257,9 @@ static bool parse_virtiofs_mount(const char *value, bool read_only, struct virti
     return true;
 }
 
+/* Long-only option values must sit above the ASCII range used by short opts. */
+#define OPT_VIRTIOFS_DAX_SIZE 1000
+
 static bool parse_cmdline(int argc, char *const argv[], struct cmdline *cmdline)
 {
     static const struct option long_options[] = {
@@ -260,6 +276,7 @@ static bool parse_cmdline(int argc, char *const argv[], struct cmdline *cmdline)
         {"gvproxy-socket", required_argument, NULL, 'G'},
         {"virtiofs", required_argument, NULL, 'V'},
         {"virtiofs-ro", required_argument, NULL, 'R'},
+        {"virtiofs-dax-size", required_argument, NULL, OPT_VIRTIOFS_DAX_SIZE},
         {"cpus", required_argument, NULL, 'u'},
         {"memory-mib", required_argument, NULL, 'M'},
         {"balloon-initial-mib", required_argument, NULL, 'A'},
@@ -295,6 +312,7 @@ static bool parse_cmdline(int argc, char *const argv[], struct cmdline *cmdline)
         .balloon_initial_mib = 0,
         .balloon_min_mib = 0,
         .virtiofs_mount_count = 0,
+        .virtiofs_dax_size = 0,
         .num_vcpus = 2,
         .gvproxy_vfkit_magic = false,
         .poweroff_after_ready = false,
@@ -362,6 +380,12 @@ static bool parse_cmdline(int argc, char *const argv[], struct cmdline *cmdline)
                 return false;
             }
             cmdline->virtiofs_mount_count++;
+            break;
+        case OPT_VIRTIOFS_DAX_SIZE:
+            if (!parse_u64(optarg, &cmdline->virtiofs_dax_size)) {
+                fprintf(stderr, "Invalid virtio-fs DAX window size: %s\n", optarg);
+                return false;
+            }
             break;
         case 'u':
             if (!parse_u8(optarg, &cmdline->num_vcpus) || cmdline->num_vcpus == 0) {
@@ -954,18 +978,15 @@ int main(int argc, char *const argv[])
     }
 
     for (size_t i = 0; i < cmdline.virtiofs_mount_count; i++) {
-        if (cmdline.virtiofs_mounts[i].read_only) {
-            err = krun_add_virtiofs3(ctx_id, cmdline.virtiofs_mounts[i].tag,
-                                     cmdline.virtiofs_mounts[i].path, 0, true);
-        } else {
-            err = krun_add_virtiofs(ctx_id, cmdline.virtiofs_mounts[i].tag,
-                                    cmdline.virtiofs_mounts[i].path);
-        }
+        /* krun_add_virtiofs3 with shm_size=0 is equivalent to krun_add_virtiofs;
+         * a non-zero --virtiofs-dax-size opens a DAX window so guests map shared
+         * read-only files straight from the host page cache. */
+        err = krun_add_virtiofs3(ctx_id, cmdline.virtiofs_mounts[i].tag,
+                                 cmdline.virtiofs_mounts[i].path,
+                                 cmdline.virtiofs_dax_size,
+                                 cmdline.virtiofs_mounts[i].read_only);
         if (err) {
-            return report_error(cmdline.virtiofs_mounts[i].read_only
-                                    ? "krun_add_virtiofs3"
-                                    : "krun_add_virtiofs",
-                                err);
+            return report_error("krun_add_virtiofs3", err);
         }
     }
 
