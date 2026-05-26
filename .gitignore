@@ -22,3 +22,8 @@ test-prefix
 /linux-sysroot
 /freebsd-sysroot
 /os_mode_artifacts/
+
+# Large example/runtime artifacts (regenerated, not committed)
+*.img
+*.eif
+src/*/src/runtime-data/eif.tar.gz
