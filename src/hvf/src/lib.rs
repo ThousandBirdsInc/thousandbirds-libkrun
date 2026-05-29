@@ -730,3 +730,320 @@ impl HvfVcpu<'_> {
         }
     }
 }
+
+// ============================================================================
+// Snapshot / restore: leaf HVF state capture
+// ============================================================================
+//
+// Phase C of `design_docs/snapshot_restore_implementation.md`. These methods
+// expose the HVF Framework register get/set calls in a snapshot-friendly
+// shape. Vcpu-thread orchestration (sending a Snapshot event to the running
+// thread so it pauses on its own context and captures) lives in
+// `src/vmm/src/macos/vstate.rs`; this file owns only the leaf primitives
+// the orchestrator calls.
+//
+// What this build captures (per vCPU):
+//
+// - General regs: X0..X30, PC, FPCR, FPSR, CPSR.
+// - SP_EL0, SP_EL1.
+// - SIMD/FP: Q0..Q31 (128 bits each).
+// - System regs: the fixed list in `HVF_SYS_REG_IDS` below — MMU
+//   (SCTLR/TCR/TTBR0/TTBR1/MAIR/AMAIR/CONTEXTIDR/CPACR/VBAR), exception
+//   state (SPSR/ELR/ESR/FAR), debug (MDSCR + AFSR0/AFSR1), thread
+//   pointers (TPIDR_EL0/EL1, TPIDRRO_EL0), virtual timer
+//   (CNTKCTL/CNTV_CTL/CNTV_CVAL).
+//
+// GICv3 distributor + redistributor state is **not** captured. The
+// wrapper-level snapshot site is expected to validate "no pending
+// interrupts" as a precondition; full GIC capture is Phase C.3 in the
+// design doc.
+
+/// HVF system registers we capture. Byte serialization order matches this
+/// list; the restore path reads them back into a parallel array.
+pub const HVF_SYS_REG_IDS: &[u16] = &[
+    hv_sys_reg_t_HV_SYS_REG_SCTLR_EL1 as u16,
+    hv_sys_reg_t_HV_SYS_REG_TCR_EL1 as u16,
+    hv_sys_reg_t_HV_SYS_REG_TTBR0_EL1 as u16,
+    hv_sys_reg_t_HV_SYS_REG_TTBR1_EL1 as u16,
+    hv_sys_reg_t_HV_SYS_REG_MAIR_EL1 as u16,
+    hv_sys_reg_t_HV_SYS_REG_AMAIR_EL1 as u16,
+    hv_sys_reg_t_HV_SYS_REG_CONTEXTIDR_EL1 as u16,
+    hv_sys_reg_t_HV_SYS_REG_CPACR_EL1 as u16,
+    hv_sys_reg_t_HV_SYS_REG_VBAR_EL1 as u16,
+    hv_sys_reg_t_HV_SYS_REG_SPSR_EL1 as u16,
+    hv_sys_reg_t_HV_SYS_REG_ELR_EL1 as u16,
+    hv_sys_reg_t_HV_SYS_REG_ESR_EL1 as u16,
+    hv_sys_reg_t_HV_SYS_REG_FAR_EL1 as u16,
+    hv_sys_reg_t_HV_SYS_REG_MDSCR_EL1 as u16,
+    hv_sys_reg_t_HV_SYS_REG_AFSR0_EL1 as u16,
+    hv_sys_reg_t_HV_SYS_REG_AFSR1_EL1 as u16,
+    hv_sys_reg_t_HV_SYS_REG_TPIDR_EL0 as u16,
+    hv_sys_reg_t_HV_SYS_REG_TPIDR_EL1 as u16,
+    hv_sys_reg_t_HV_SYS_REG_TPIDRRO_EL0 as u16,
+    hv_sys_reg_t_HV_SYS_REG_CNTKCTL_EL1 as u16,
+    hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0 as u16,
+    hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0 as u16,
+];
+
+/// Captured HVF vCPU state.
+#[derive(Debug, Clone)]
+pub struct HvfVcpuState {
+    /// X0..X30, PC, FPCR, FPSR, CPSR (in that order). 35 entries.
+    pub general_regs: [u64; 35],
+    /// SP_EL0, SP_EL1.
+    pub stack_pointers: [u64; 2],
+    /// Q0..Q31, 128 bits each.
+    pub simd_regs: [u128; 32],
+    /// One entry per ID in [`HVF_SYS_REG_IDS`], same order.
+    pub sys_regs: Vec<u64>,
+}
+
+const HVF_VCPU_STATE_VERSION: u32 = 1;
+const HVF_VCPU_STATE_MAGIC: &[u8; 8] = b"KRUNHVS1";
+
+impl HvfVcpuState {
+    /// Serialize for embedding in a `VcpuStateV1::payload` byte buffer.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(
+            HVF_VCPU_STATE_MAGIC.len()
+                + 4
+                + 4
+                + self.general_regs.len() * 8
+                + self.stack_pointers.len() * 8
+                + self.simd_regs.len() * 16
+                + self.sys_regs.len() * 8,
+        );
+        buf.extend_from_slice(HVF_VCPU_STATE_MAGIC);
+        buf.extend_from_slice(&HVF_VCPU_STATE_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(self.sys_regs.len() as u32).to_le_bytes());
+        for v in &self.general_regs {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in &self.stack_pointers {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in &self.simd_regs {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in &self.sys_regs {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < HVF_VCPU_STATE_MAGIC.len() + 4 + 4 {
+            return Err("HvfVcpuState bytes too short for header".into());
+        }
+        if &bytes[..HVF_VCPU_STATE_MAGIC.len()] != HVF_VCPU_STATE_MAGIC {
+            return Err("bad HvfVcpuState magic".into());
+        }
+        let mut pos = HVF_VCPU_STATE_MAGIC.len();
+        let version = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        if version != HVF_VCPU_STATE_VERSION {
+            return Err(format!(
+                "HvfVcpuState version mismatch: expected {HVF_VCPU_STATE_VERSION}, got {version}"
+            ));
+        }
+        let sys_regs_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        let expected = pos + 35 * 8 + 2 * 8 + 32 * 16 + sys_regs_len * 8;
+        if bytes.len() != expected {
+            return Err(format!(
+                "HvfVcpuState bytes wrong size: expected {expected}, got {}",
+                bytes.len()
+            ));
+        }
+
+        let mut general_regs = [0u64; 35];
+        for v in &mut general_regs {
+            *v = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+        }
+        let mut stack_pointers = [0u64; 2];
+        for v in &mut stack_pointers {
+            *v = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+        }
+        let mut simd_regs = [0u128; 32];
+        for v in &mut simd_regs {
+            *v = u128::from_le_bytes(bytes[pos..pos + 16].try_into().unwrap());
+            pos += 16;
+        }
+        let mut sys_regs = Vec::with_capacity(sys_regs_len);
+        for _ in 0..sys_regs_len {
+            sys_regs.push(u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()));
+            pos += 8;
+        }
+        Ok(Self {
+            general_regs,
+            stack_pointers,
+            simd_regs,
+            sys_regs,
+        })
+    }
+}
+
+impl HvfVcpu<'_> {
+    /// Capture this vCPU's HVF state. The vCPU must not be currently
+    /// executing in `run()` — HVF rejects register get/set on a running
+    /// vCPU. The caller's vCPU-thread orchestration (`vcpu_request_exit`
+    /// + acknowledgement via the event channel) is responsible for that.
+    pub fn save_state(&self) -> Result<HvfVcpuState, Error> {
+        let mut general_regs = [0u64; 35];
+        for i in 0..=30 {
+            general_regs[i as usize] = self.read_reg(hv_reg_t_HV_REG_X0 + i)?;
+        }
+        general_regs[31] = self.read_reg(hv_reg_t_HV_REG_PC)?;
+        general_regs[32] = self.read_reg(hv_reg_t_HV_REG_FPCR)?;
+        general_regs[33] = self.read_reg(hv_reg_t_HV_REG_FPSR)?;
+        general_regs[34] = self.read_reg(hv_reg_t_HV_REG_CPSR)?;
+
+        let stack_pointers = [
+            self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_SP_EL0 as u16)?,
+            self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_SP_EL1 as u16)?,
+        ];
+
+        let mut simd_regs = [0u128; 32];
+        for (i, slot) in simd_regs.iter_mut().enumerate() {
+            let mut raw: hv_simd_fp_uchar16_t = 0;
+            let ret = unsafe {
+                hv_vcpu_get_simd_fp_reg(
+                    self.vcpuid,
+                    hv_simd_fp_reg_t_HV_SIMD_FP_REG_Q0 + i as u32,
+                    &mut raw as *mut _,
+                )
+            };
+            if ret != HV_SUCCESS {
+                return Err(Error::VcpuReadRegister);
+            }
+            *slot = raw;
+        }
+
+        let mut sys_regs = Vec::with_capacity(HVF_SYS_REG_IDS.len());
+        for &id in HVF_SYS_REG_IDS {
+            sys_regs.push(self.read_sys_reg(id)?);
+        }
+
+        Ok(HvfVcpuState {
+            general_regs,
+            stack_pointers,
+            simd_regs,
+            sys_regs,
+        })
+    }
+
+    /// Restore this vCPU's HVF state. Same precondition: vCPU must not be
+    /// running. The vCPU resumes at the saved PC when its run loop is next
+    /// entered.
+    pub fn restore_state(&self, state: &HvfVcpuState) -> Result<(), Error> {
+        if state.sys_regs.len() != HVF_SYS_REG_IDS.len() {
+            // Mismatched capture vs restore set — the snapshot was taken
+            // with a different libkrun build. Caller should surface this
+            // as a version error.
+            return Err(Error::VcpuInitialRegisters);
+        }
+        for i in 0..=30u32 {
+            self.write_reg(hv_reg_t_HV_REG_X0 + i, state.general_regs[i as usize])?;
+        }
+        self.write_reg(hv_reg_t_HV_REG_PC, state.general_regs[31])?;
+        self.write_reg(hv_reg_t_HV_REG_FPCR, state.general_regs[32])?;
+        self.write_reg(hv_reg_t_HV_REG_FPSR, state.general_regs[33])?;
+        self.write_reg(hv_reg_t_HV_REG_CPSR, state.general_regs[34])?;
+
+        self.write_sys_reg(
+            hv_sys_reg_t_HV_SYS_REG_SP_EL0 as u16,
+            state.stack_pointers[0],
+        )?;
+        self.write_sys_reg(
+            hv_sys_reg_t_HV_SYS_REG_SP_EL1 as u16,
+            state.stack_pointers[1],
+        )?;
+
+        for (i, q) in state.simd_regs.iter().enumerate() {
+            let ret = unsafe {
+                hv_vcpu_set_simd_fp_reg(
+                    self.vcpuid,
+                    hv_simd_fp_reg_t_HV_SIMD_FP_REG_Q0 + i as u32,
+                    *q as hv_simd_fp_uchar16_t,
+                )
+            };
+            if ret != HV_SUCCESS {
+                return Err(Error::VcpuSetRegister);
+            }
+        }
+
+        for (i, &id) in HVF_SYS_REG_IDS.iter().enumerate() {
+            self.write_sys_reg(id, state.sys_regs[i])?;
+        }
+        Ok(())
+    }
+
+    fn write_sys_reg(&self, reg: u16, val: u64) -> Result<(), Error> {
+        let ret = unsafe { hv_vcpu_set_sys_reg(self.vcpuid, reg, val) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuSetSystemRegister(reg, val))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn vcpu_state_round_trip_preserves_all_fields() {
+        let original = HvfVcpuState {
+            general_regs: {
+                let mut a = [0u64; 35];
+                for (i, slot) in a.iter_mut().enumerate() {
+                    *slot = 0x1000 + i as u64;
+                }
+                a
+            },
+            stack_pointers: [0xDEAD_BEEF_0000, 0xCAFE_BABE_0000],
+            simd_regs: {
+                let mut a = [0u128; 32];
+                for (i, slot) in a.iter_mut().enumerate() {
+                    *slot = ((i as u128) << 64) | 0xFEED_F00D;
+                }
+                a
+            },
+            sys_regs: (0..HVF_SYS_REG_IDS.len() as u64)
+                .map(|i| 0xAA_0000 + i)
+                .collect(),
+        };
+        let bytes = original.to_bytes();
+        let parsed = HvfVcpuState::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.general_regs, original.general_regs);
+        assert_eq!(parsed.stack_pointers, original.stack_pointers);
+        assert_eq!(parsed.simd_regs, original.simd_regs);
+        assert_eq!(parsed.sys_regs, original.sys_regs);
+    }
+
+    #[test]
+    fn bad_magic_fails() {
+        // 16 bytes (header size) of junk that isn't the expected magic.
+        let bytes = b"GARBAGE!\x00\x00\x00\x00\x00\x00\x00\x00";
+        let err = HvfVcpuState::from_bytes(bytes).unwrap_err();
+        assert!(err.contains("magic"));
+    }
+
+    #[test]
+    fn wrong_size_fails() {
+        let mut bytes = HvfVcpuState {
+            general_regs: [0; 35],
+            stack_pointers: [0; 2],
+            simd_regs: [0; 32],
+            sys_regs: vec![0; HVF_SYS_REG_IDS.len()],
+        }
+        .to_bytes();
+        bytes.push(0);
+        let err = HvfVcpuState::from_bytes(&bytes).unwrap_err();
+        assert!(err.contains("size"));
+    }
+}

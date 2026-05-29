@@ -2041,3 +2041,279 @@ mod tests {
         assert!(validate_signal_num(sigrtmin() + VCPU_RTSIG_OFFSET).is_ok());
     }
 }
+
+// ============================================================================
+// Snapshot / restore trait impls (Phase B of the snapshot implementation plan)
+// ============================================================================
+//
+// Wires the existing private save_state / restore_state into the public
+// SnapshotableVm / SnapshotableVcpu traits from src/vmm/src/snapshot/state.rs.
+// The byte serialization here treats kvm-bindings #[repr(C)] FFI structs as
+// raw POD bytes — sound because those structs are kernel-ABI mirrors with
+// no Rust-side invariants. FAM types (CpuId, Msrs) get explicit length-
+// prefixed encoding because their byte size depends on a runtime entry count.
+
+use crate::snapshot::state::{
+    ArchKind, BackendKind, SnapshotableVcpu, SnapshotableVm, VcpuStateV1, VmStateV1,
+};
+use crate::snapshot::SnapshotError;
+
+#[cfg(target_arch = "x86_64")]
+mod snapshot_serde {
+    use super::*;
+    use kvm_bindings::{kvm_cpuid_entry2, kvm_msr_entry};
+
+    /// SAFETY: `T` must be `#[repr(C)]` POD (kvm-bindings FFI structs all
+    /// qualify). Returns a byte view of `value`'s bytes; the caller must not
+    /// outlive `value`.
+    pub(super) unsafe fn pod_as_bytes<T>(value: &T) -> &[u8] {
+        std::slice::from_raw_parts(value as *const T as *const u8, std::mem::size_of::<T>())
+    }
+
+    pub(super) struct ByteReader<'a> {
+        buf: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> ByteReader<'a> {
+        pub(super) fn new(buf: &'a [u8]) -> Self {
+            Self { buf, pos: 0 }
+        }
+        pub(super) fn read_u32(&mut self) -> Result<u32, SnapshotError> {
+            let bytes = self.read_slice(4)?;
+            Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+        }
+        pub(super) fn read_slice(&mut self, len: usize) -> Result<&'a [u8], SnapshotError> {
+            if self.buf.len() - self.pos < len {
+                return Err(SnapshotError::Parse(format!(
+                    "ran out of bytes (need {len}, have {})",
+                    self.buf.len() - self.pos
+                )));
+            }
+            let s = &self.buf[self.pos..self.pos + len];
+            self.pos += len;
+            Ok(s)
+        }
+        /// SAFETY: `T` must be `#[repr(C)]` POD; the caller is responsible
+        /// for the byte layout matching `T`.
+        pub(super) unsafe fn read_pod<T: Copy>(&mut self) -> Result<T, SnapshotError> {
+            let size = std::mem::size_of::<T>();
+            let slice = self.read_slice(size)?;
+            let mut value = std::mem::MaybeUninit::<T>::uninit();
+            std::ptr::copy_nonoverlapping(
+                slice.as_ptr(),
+                value.as_mut_ptr() as *mut u8,
+                size,
+            );
+            Ok(value.assume_init())
+        }
+        pub(super) fn finished(&self) -> bool {
+            self.pos == self.buf.len()
+        }
+    }
+
+    // --- VmState serialization ---------------------------------------------
+
+    pub(super) fn vm_state_to_bytes(state: &VmState) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(
+            std::mem::size_of::<kvm_pit_state2>()
+                + std::mem::size_of::<kvm_clock_data>()
+                + std::mem::size_of::<kvm_irqchip>() * 3,
+        );
+        unsafe {
+            buf.extend_from_slice(pod_as_bytes(&state.pitstate));
+            buf.extend_from_slice(pod_as_bytes(&state.clock));
+            buf.extend_from_slice(pod_as_bytes(&state.pic_master));
+            buf.extend_from_slice(pod_as_bytes(&state.pic_slave));
+            buf.extend_from_slice(pod_as_bytes(&state.ioapic));
+        }
+        buf
+    }
+
+    pub(super) fn vm_state_from_bytes(bytes: &[u8]) -> Result<VmState, SnapshotError> {
+        let mut r = ByteReader::new(bytes);
+        let state = unsafe {
+            VmState {
+                pitstate: r.read_pod()?,
+                clock: r.read_pod()?,
+                pic_master: r.read_pod()?,
+                pic_slave: r.read_pod()?,
+                ioapic: r.read_pod()?,
+            }
+        };
+        if !r.finished() {
+            return Err(SnapshotError::Parse(
+                "trailing bytes after VmState".to_string(),
+            ));
+        }
+        Ok(state)
+    }
+
+    // --- VcpuState serialization -------------------------------------------
+
+    pub(super) fn vcpu_state_to_bytes(state: &VcpuState) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // CpuId: nent (u32) + nent * kvm_cpuid_entry2
+        let cpuid_entries = state.cpuid.as_slice();
+        buf.extend_from_slice(&(cpuid_entries.len() as u32).to_le_bytes());
+        for entry in cpuid_entries {
+            unsafe { buf.extend_from_slice(pod_as_bytes(entry)) };
+        }
+
+        // Msrs: nmsrs (u32) + nmsrs * kvm_msr_entry
+        let msr_entries = state.msrs.as_slice();
+        buf.extend_from_slice(&(msr_entries.len() as u32).to_le_bytes());
+        for entry in msr_entries {
+            unsafe { buf.extend_from_slice(pod_as_bytes(entry)) };
+        }
+
+        unsafe {
+            buf.extend_from_slice(pod_as_bytes(&state.debug_regs));
+            buf.extend_from_slice(pod_as_bytes(&state.lapic));
+            buf.extend_from_slice(pod_as_bytes(&state.mp_state));
+            buf.extend_from_slice(pod_as_bytes(&state.regs));
+            buf.extend_from_slice(pod_as_bytes(&state.sregs));
+            buf.extend_from_slice(pod_as_bytes(&state.vcpu_events));
+            buf.extend_from_slice(pod_as_bytes(&state.xcrs));
+            buf.extend_from_slice(pod_as_bytes(&state.xsave));
+        }
+        buf
+    }
+
+    pub(super) fn vcpu_state_from_bytes(bytes: &[u8]) -> Result<VcpuState, SnapshotError> {
+        let mut r = ByteReader::new(bytes);
+
+        // CpuId.
+        let cpuid_nent = r.read_u32()? as usize;
+        if cpuid_nent > KVM_MAX_CPUID_ENTRIES as usize {
+            return Err(SnapshotError::Parse(format!(
+                "implausible cpuid nent {cpuid_nent}"
+            )));
+        }
+        let mut cpuid = CpuId::new(cpuid_nent).map_err(|e| {
+            SnapshotError::Parse(format!("CpuId::new({cpuid_nent}) failed: {e:?}"))
+        })?;
+        {
+            let slots = cpuid.as_mut_slice();
+            for slot in slots.iter_mut() {
+                *slot = unsafe { r.read_pod::<kvm_cpuid_entry2>()? };
+            }
+        }
+
+        // Msrs.
+        let nmsrs = r.read_u32()? as usize;
+        let mut msrs = Msrs::new(nmsrs).map_err(|e| {
+            SnapshotError::Parse(format!("Msrs::new({nmsrs}) failed: {e:?}"))
+        })?;
+        {
+            let slots = msrs.as_mut_slice();
+            for slot in slots.iter_mut() {
+                *slot = unsafe { r.read_pod::<kvm_msr_entry>()? };
+            }
+        }
+
+        let state = unsafe {
+            VcpuState {
+                cpuid,
+                msrs,
+                debug_regs: r.read_pod()?,
+                lapic: r.read_pod()?,
+                mp_state: r.read_pod()?,
+                regs: r.read_pod()?,
+                sregs: r.read_pod()?,
+                vcpu_events: r.read_pod()?,
+                xcrs: r.read_pod()?,
+                xsave: r.read_pod()?,
+            }
+        };
+        if !r.finished() {
+            return Err(SnapshotError::Parse(
+                "trailing bytes after VcpuState".to_string(),
+            ));
+        }
+        Ok(state)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl SnapshotableVm for Vm {
+    fn save_vm_state(&self) -> std::result::Result<VmStateV1, SnapshotError> {
+        let state = self
+            .save_state()
+            .map_err(|e| SnapshotError::BackendError(format!("KVM VM save_state: {e:?}")))?;
+        let payload = snapshot_serde::vm_state_to_bytes(&state);
+        Ok(VmStateV1::new(BackendKind::Kvm, ArchKind::X86_64, payload))
+    }
+
+    fn restore_vm_state(&self, state: &VmStateV1) -> std::result::Result<(), SnapshotError> {
+        if state.backend != BackendKind::Kvm || state.arch != ArchKind::X86_64 {
+            return Err(SnapshotError::BackendMismatch {
+                expected: "kvm/x86_64",
+                found: format!("{}/{}", state.backend_str(), state.arch_str()),
+            });
+        }
+        let vm_state = snapshot_serde::vm_state_from_bytes(&state.payload)?;
+        self.restore_state(&vm_state)
+            .map_err(|e| SnapshotError::BackendError(format!("KVM VM restore_state: {e:?}")))?;
+        Ok(())
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+impl SnapshotableVm for Vm {
+    fn save_vm_state(&self) -> std::result::Result<VmStateV1, SnapshotError> {
+        Err(SnapshotError::UnsupportedBackend(
+            "KVM aarch64/riscv VM state capture (not implemented in this build)",
+        ))
+    }
+    fn restore_vm_state(&self, _state: &VmStateV1) -> std::result::Result<(), SnapshotError> {
+        Err(SnapshotError::UnsupportedBackend(
+            "KVM aarch64/riscv VM state restore (not implemented in this build)",
+        ))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl SnapshotableVcpu for Vcpu {
+    fn save_vcpu_state(&self) -> std::result::Result<VcpuStateV1, SnapshotError> {
+        let state = self
+            .save_state()
+            .map_err(|e| SnapshotError::BackendError(format!("KVM vCPU save_state: {e:?}")))?;
+        let payload = snapshot_serde::vcpu_state_to_bytes(&state);
+        Ok(VcpuStateV1::new(
+            BackendKind::Kvm,
+            ArchKind::X86_64,
+            self.id as u32,
+            payload,
+        ))
+    }
+
+    fn restore_vcpu_state(&self, state: &VcpuStateV1) -> std::result::Result<(), SnapshotError> {
+        if state.backend != BackendKind::Kvm || state.arch != ArchKind::X86_64 {
+            return Err(SnapshotError::BackendMismatch {
+                expected: "kvm/x86_64",
+                found: format!("{}/{}", state.backend.as_str(), state.arch.as_str()),
+            });
+        }
+        let vcpu_state = snapshot_serde::vcpu_state_from_bytes(&state.payload)?;
+        self.restore_state(vcpu_state)
+            .map_err(|e| SnapshotError::BackendError(format!("KVM vCPU restore_state: {e:?}")))?;
+        Ok(())
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+impl SnapshotableVcpu for Vcpu {
+    fn save_vcpu_state(&self) -> std::result::Result<VcpuStateV1, SnapshotError> {
+        Err(SnapshotError::UnsupportedBackend(
+            "KVM aarch64/riscv vCPU state capture (not implemented in this build)",
+        ))
+    }
+    fn restore_vcpu_state(&self, _state: &VcpuStateV1) -> std::result::Result<(), SnapshotError> {
+        Err(SnapshotError::UnsupportedBackend(
+            "KVM aarch64/riscv vCPU state restore (not implemented in this build)",
+        ))
+    }
+}
+

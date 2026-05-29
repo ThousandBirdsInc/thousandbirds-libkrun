@@ -440,6 +440,7 @@ mod tests {
             kernel_cmdline: default_kernel_cmdline(),
             kernel_bundle: Default::default(),
             external_kernel: None,
+            balloon: Default::default(),
             fs: Default::default(),
             vsock: Default::default(),
             #[cfg(feature = "blk")]

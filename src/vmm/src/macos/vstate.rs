@@ -729,3 +729,79 @@ mod tests {
         );
     }
 }
+
+// ============================================================================
+// Snapshot / restore trait impls (Phase C wrapper)
+// ============================================================================
+//
+// Wires the leaf HVF state capture from `hvf::HvfVcpu` (see
+// `src/hvf/src/lib.rs` HvfVcpuState) through the public `SnapshotableVm`
+// / `SnapshotableVcpu` traits. The VM-level impl validates the snapshot
+// precondition that no interrupts are pending; the vCPU-level impl is
+// currently a placeholder pending the vCPU-thread orchestration described
+// in `design_docs/snapshot_restore_implementation.md` §"Phase C.4".
+
+use crate::snapshot::state::{
+    ArchKind, BackendKind, SnapshotableVcpu, SnapshotableVm, VcpuStateV1, VmStateV1,
+};
+use crate::snapshot::SnapshotError;
+
+impl SnapshotableVm for Vm {
+    /// Capture HVF VM-level state. Today this is a no-op payload because
+    /// GICv3 state capture (Phase C.3) is not yet implemented; the
+    /// snapshot site is expected to validate "no pending interrupts" as a
+    /// precondition. The empty payload + manifest's HVF tag still let a
+    /// restored VM rebuild a fresh GIC and continue.
+    fn save_vm_state(&self) -> std::result::Result<VmStateV1, SnapshotError> {
+        // Empty payload — a future GIC capture writes here. The wrapper
+        // contract is "snapshot only when no SPIs are pending"; that is
+        // checked at the wrapper level (cooperative quiesce + drain).
+        Ok(VmStateV1::new(BackendKind::Hvf, ArchKind::Aarch64, Vec::new()))
+    }
+
+    fn restore_vm_state(&self, state: &VmStateV1) -> std::result::Result<(), SnapshotError> {
+        if state.backend != BackendKind::Hvf || state.arch != ArchKind::Aarch64 {
+            return Err(SnapshotError::BackendMismatch {
+                expected: "hvf/aarch64",
+                found: format!("{}/{}", state.backend.as_str(), state.arch.as_str()),
+            });
+        }
+        if !state.payload.is_empty() {
+            // Future-proof: a snapshot written by a later libkrun that
+            // does capture GIC state would have a non-empty payload; we
+            // don't yet know how to consume it.
+            return Err(SnapshotError::VersionMismatch {
+                expected: 1,
+                found: 2,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl SnapshotableVcpu for Vcpu {
+    /// HVF vCPU snapshot needs vCPU-thread orchestration: the snapshot
+    /// caller must send an event over `event_sender` and have the running
+    /// vCPU thread pause itself, call `HvfVcpu::save_state` from its own
+    /// context (HVF rejects register reads on a vCPU executing in run()),
+    /// and send the bytes back. This wiring is the immediate follow-on to
+    /// this commit — the HVF leaf primitives are landed
+    /// (`HvfVcpu::save_state` / `restore_state` in `src/hvf/src/lib.rs`)
+    /// but the orchestration into the existing VcpuEvent channel is
+    /// `design_docs/snapshot_restore_implementation.md` §"Phase C.4".
+    fn save_vcpu_state(&self) -> std::result::Result<VcpuStateV1, SnapshotError> {
+        Err(SnapshotError::UnsupportedBackend(
+            "macos::Vcpu::save_vcpu_state — needs Pause + Snapshot VcpuEvent \
+             orchestration in the vCPU thread (Phase C.4 follow-on). The leaf \
+             HvfVcpu::save_state exists and is callable directly by code that \
+             owns an HvfVcpu reference.",
+        ))
+    }
+
+    fn restore_vcpu_state(&self, _state: &VcpuStateV1) -> std::result::Result<(), SnapshotError> {
+        Err(SnapshotError::UnsupportedBackend(
+            "macos::Vcpu::restore_vcpu_state — needs Resume + Restore VcpuEvent \
+             orchestration in the vCPU thread (Phase C.4 follow-on).",
+        ))
+    }
+}

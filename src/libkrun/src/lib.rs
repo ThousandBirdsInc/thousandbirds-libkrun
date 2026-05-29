@@ -194,6 +194,13 @@ struct ContextConfig {
     vmm_gid: Option<libc::gid_t>,
     /// Unix socket path for the runtime memory-resize control listener.
     balloon_control_socket: Option<PathBuf>,
+    /// Snapshot directory to restore the VM from at start. When `Some`,
+    /// `krun_start_enter` is expected to call into the snapshot subsystem
+    /// instead of cold-booting. Today the field is stored but `start_enter`
+    /// returns `-ENOSYS` if it is set — the runtime restore path is the
+    /// Phase D follow-on in
+    /// `design_docs/snapshot_restore_implementation.md`.
+    snapshot_restore_from: Option<PathBuf>,
 }
 
 impl ContextConfig {
@@ -804,6 +811,75 @@ pub unsafe extern "C" fn krun_set_balloon(
     }
 
     KRUN_SUCCESS
+}
+
+/// Configure this context to restore the VM from a snapshot directory rather
+/// than cold-booting. Must be called *before* `krun_start_enter`. The
+/// directory layout is the one produced by `krun_snapshot_to_path` — see
+/// `src/vmm/src/snapshot/mod.rs` for the file naming conventions.
+///
+/// Today this function records the path; the actual restore execution in
+/// `krun_start_enter` returns `-ENOSYS` because the orchestration to
+/// rebuild memory + vCPU state at boot time is Phase D follow-on work
+/// (`design_docs/snapshot_restore_implementation.md`). Wrapper-side callers
+/// can wire `krun_set_snapshot_restore_from` into their launcher today;
+/// the symbol is reserved and the storage works, so when libkrun lands
+/// the restore execution they need no code change.
+///
+/// Returns 0 on success, -ENOENT if the context ID is unknown, -EINVAL on
+/// a bad path string.
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_set_snapshot_restore_from(
+    ctx_id: u32,
+    path: *const c_char,
+) -> i32 {
+    let path_buf = if path.is_null() {
+        None
+    } else {
+        match CStr::from_ptr(path).to_str() {
+            Ok(p) => Some(PathBuf::from(p)),
+            Err(_) => return -libc::EINVAL,
+        }
+    };
+    with_cfg(ctx_id, |cfg| {
+        cfg.snapshot_restore_from = path_buf;
+        KRUN_SUCCESS
+    })
+}
+
+/// Snapshot the running VM associated with `ctx_id` to a directory. The
+/// caller must have paused the vCPUs and quiesced devices before invoking
+/// this — the wrapper layer's cooperative quiesce protocol covers that.
+///
+/// On success the directory contains `snapshot.bin` (VM-level state),
+/// `vcpu_NNN.bin` (one per vCPU), and `memory.bin` (sparse guest memory
+/// image), matching the layout in `src/vmm/src/snapshot/mod.rs`.
+///
+/// Today this function returns `-ENOSYS`: the wrapper-side API is wired
+/// through (`krun_set_snapshot_restore_from` reserves the restore path
+/// symmetrically) but the vCPU-thread Pause + Snapshot event orchestration
+/// in `src/vmm/src/macos/vstate.rs` is the Phase D follow-on. The C ABI
+/// symbol is reserved here so external consumers (the wrapper, os_mode)
+/// can integrate against it now and pick up the implementation transparently
+/// when it lands.
+///
+/// Returns 0 on success, -ENOSYS until the runtime orchestration ships,
+/// -ENOENT for an unknown context ID, -EINVAL on a bad path.
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_snapshot_to_path(ctx_id: u32, path: *const c_char) -> i32 {
+    if path.is_null() {
+        return -libc::EINVAL;
+    }
+    let _ = match CStr::from_ptr(path).to_str() {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => return -libc::EINVAL,
+    };
+    if !CTX_MAP.lock().unwrap().contains_key(&ctx_id) {
+        return -libc::ENOENT;
+    }
+    -libc::ENOSYS
 }
 
 #[allow(clippy::missing_safety_doc)]

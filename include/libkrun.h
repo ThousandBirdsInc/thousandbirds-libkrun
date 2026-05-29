@@ -1453,6 +1453,54 @@ int32_t krun_set_root_disk_remount(uint32_t ctx_id, const char *device, const ch
  */
 int32_t krun_start_enter(uint32_t ctx_id);
 
+/**
+ * Configure this context to restore the VM from a snapshot directory rather
+ * than cold-booting. Must be called before krun_start_enter. The directory
+ * must contain the files produced by a prior krun_snapshot_to_path call
+ * (snapshot.bin, vcpu_NNN.bin, memory.bin; see
+ * src/vmm/src/snapshot/mod.rs for the layout).
+ *
+ * Today the path is recorded but the actual restore execution returns
+ * -ENOSYS — the in-VM orchestration is Phase D follow-on work in
+ * design_docs/snapshot_restore_implementation.md. The C ABI symbol is
+ * reserved so external consumers (krunkit, the agent-sandbox wrapper, etc.)
+ * can integrate against it now.
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID.
+ *  "path"   - filesystem path of the snapshot directory.
+ *
+ * Returns:
+ *  0        - configuration recorded.
+ *  -ENOENT  - unknown context ID.
+ *  -EINVAL  - path string is not valid UTF-8.
+ */
+int32_t krun_set_snapshot_restore_from(uint32_t ctx_id, const char *path);
+
+/**
+ * Snapshot the running VM associated with ctx_id to the given directory.
+ * The caller must have paused the vCPUs and quiesced devices first — the
+ * agent-sandbox wrapper layer's cooperative quiesce protocol covers that
+ * (see thousandbirds-agent-sandbox/src/quiesce.rs).
+ *
+ * Today returns -ENOSYS pending the Phase D vCPU-thread snapshot
+ * orchestration (design_docs/snapshot_restore_implementation.md). The C
+ * ABI symbol is reserved so callers can integrate now and pick up the
+ * implementation transparently when it lands.
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID.
+ *  "path"   - filesystem path where the snapshot directory should be
+ *             created.
+ *
+ * Returns:
+ *  0        - snapshot written (once implementation lands).
+ *  -ENOSYS  - runtime orchestration not yet implemented in this build.
+ *  -ENOENT  - unknown context ID.
+ *  -EINVAL  - path is null or not valid UTF-8.
+ */
+int32_t krun_snapshot_to_path(uint32_t ctx_id, const char *path);
+
 #ifdef __cplusplus
 }
 #endif

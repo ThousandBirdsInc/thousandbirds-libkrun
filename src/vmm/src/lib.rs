@@ -21,6 +21,10 @@ pub mod resources;
 /// Signal handling utilities.
 #[cfg(target_os = "linux")]
 pub mod signal_handler;
+/// Public snapshot / restore surface — types, traits, on-disk formats.
+/// See `design_docs/snapshot_restore_implementation.md` for the design and
+/// the backend support matrix.
+pub mod snapshot;
 /// Wrappers over structures used to configure the VMM.
 pub mod vmm_config;
 

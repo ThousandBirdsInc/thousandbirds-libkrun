@@ -57,6 +57,12 @@ struct cmdline {
     const char *passt_socket;
     const char *gvproxy_socket;
     const char *control_socket;
+    /* Snapshot/restore (Phase D of snapshot_restore_implementation.md).
+     * --restore PATH restores a previously-captured VM rather than
+     * cold-booting; libkrun currently returns -ENOSYS until the runtime
+     * orchestration ships, so this stays an opt-in launcher flag. */
+    const char *snapshot_restore_from;
+    const char *snapshot_out;
     struct virtiofs_mount virtiofs_mounts[MAX_VIRTIOFS_MOUNTS];
     uint64_t virtiofs_dax_size;
     uint32_t net_features;
@@ -259,6 +265,8 @@ static bool parse_virtiofs_mount(const char *value, bool read_only, struct virti
 
 /* Long-only option values must sit above the ASCII range used by short opts. */
 #define OPT_VIRTIOFS_DAX_SIZE 1000
+#define OPT_RESTORE 1001
+#define OPT_SNAPSHOT_OUT 1002
 
 static bool parse_cmdline(int argc, char *const argv[], struct cmdline *cmdline)
 {
@@ -277,6 +285,8 @@ static bool parse_cmdline(int argc, char *const argv[], struct cmdline *cmdline)
         {"virtiofs", required_argument, NULL, 'V'},
         {"virtiofs-ro", required_argument, NULL, 'R'},
         {"virtiofs-dax-size", required_argument, NULL, OPT_VIRTIOFS_DAX_SIZE},
+        {"restore", required_argument, NULL, OPT_RESTORE},
+        {"snapshot-out", required_argument, NULL, OPT_SNAPSHOT_OUT},
         {"cpus", required_argument, NULL, 'u'},
         {"memory-mib", required_argument, NULL, 'M'},
         {"balloon-initial-mib", required_argument, NULL, 'A'},
@@ -305,6 +315,8 @@ static bool parse_cmdline(int argc, char *const argv[], struct cmdline *cmdline)
         .passt_socket = NULL,
         .gvproxy_socket = NULL,
         .control_socket = NULL,
+        .snapshot_restore_from = NULL,
+        .snapshot_out = NULL,
         .net_features = COMPAT_NET_FEATURES,
         .kernel_format = DEFAULT_KERNEL_FORMAT,
         .disk_sync_mode = KRUN_SYNC_RELAXED,
@@ -386,6 +398,12 @@ static bool parse_cmdline(int argc, char *const argv[], struct cmdline *cmdline)
                 fprintf(stderr, "Invalid virtio-fs DAX window size: %s\n", optarg);
                 return false;
             }
+            break;
+        case OPT_RESTORE:
+            cmdline->snapshot_restore_from = optarg;
+            break;
+        case OPT_SNAPSHOT_OUT:
+            cmdline->snapshot_out = optarg;
             break;
         case 'u':
             if (!parse_u8(optarg, &cmdline->num_vcpus) || cmdline->num_vcpus == 0) {
@@ -947,6 +965,19 @@ int main(int argc, char *const argv[])
     }
     if ((err = krun_set_os_mode(ctx_id))) {
         return report_error("krun_set_os_mode", err);
+    }
+    /* Phase D: record the snapshot restore path before krun_start_enter.
+     * libkrun stores the path; the actual restore execution lands when the
+     * Phase D vCPU-thread snapshot orchestration ships
+     * (design_docs/snapshot_restore_implementation.md). Until then,
+     * krun_start_enter is unaffected because the restore path is not yet
+     * consulted in cold-boot code. The --snapshot-out path is recorded for
+     * the same reason; the control-socket trigger that turns it into a
+     * krun_snapshot_to_path call is the same follow-on. */
+    if (cmdline.snapshot_restore_from != NULL) {
+        if ((err = krun_set_snapshot_restore_from(ctx_id, cmdline.snapshot_restore_from))) {
+            return report_error("krun_set_snapshot_restore_from", err);
+        }
     }
     char *owned_kernel_cmdline = NULL;
     const char *kernel_cmdline = effective_kernel_cmdline(&cmdline, &owned_kernel_cmdline);
