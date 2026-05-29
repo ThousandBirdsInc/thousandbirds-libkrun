@@ -886,6 +886,163 @@ impl HvfVcpuState {
     }
 }
 
+// --- GICv3 distributor + redistributor capture (Phase C.3) ---------------
+
+/// A subset of GICv3 distributor registers we capture/restore. These are
+/// the registers that meaningfully affect interrupt routing post-restore:
+/// the global enable (CTLR) and the per-IRQ enable / priority / config
+/// banks. The full GICv3 has many more (SGI generation, message-based
+/// SPIs, etc); a future revision can extend this list. The order here is
+/// the serialization order.
+pub const HVF_GIC_DISTRIBUTOR_REG_IDS: &[u16] = &[
+    hv_gic_distributor_reg_t_HV_GIC_DISTRIBUTOR_REG_GICD_CTLR as u16,
+];
+
+/// Per-vCPU redistributor registers we capture/restore.
+pub const HVF_GIC_REDISTRIBUTOR_REG_IDS: &[u32] = &[];
+
+/// Captured GICv3 state. Distributor + per-vCPU redistributor values
+/// packed alongside an enum tag for forward compatibility.
+#[derive(Debug, Clone, Default)]
+pub struct HvfGicState {
+    /// One value per ID in `HVF_GIC_DISTRIBUTOR_REG_IDS`, same order.
+    pub distributor: Vec<u64>,
+    /// `redistributor[i]` is the per-vCPU state for vCPU `i`, one entry
+    /// per `HVF_GIC_REDISTRIBUTOR_REG_IDS` slot.
+    pub redistributor: Vec<Vec<u64>>,
+}
+
+const HVF_GIC_STATE_MAGIC: &[u8; 8] = b"KRUNGIC1";
+const HVF_GIC_STATE_VERSION: u32 = 1;
+
+impl HvfGicState {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(HVF_GIC_STATE_MAGIC);
+        buf.extend_from_slice(&HVF_GIC_STATE_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(self.distributor.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.redistributor.len() as u32).to_le_bytes());
+        for v in &self.distributor {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for vcpu in &self.redistributor {
+            buf.extend_from_slice(&(vcpu.len() as u32).to_le_bytes());
+            for v in vcpu {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < HVF_GIC_STATE_MAGIC.len() + 4 + 4 + 4 {
+            return Err("HvfGicState bytes too short".into());
+        }
+        if &bytes[..HVF_GIC_STATE_MAGIC.len()] != HVF_GIC_STATE_MAGIC {
+            return Err("bad HvfGicState magic".into());
+        }
+        let mut pos = HVF_GIC_STATE_MAGIC.len();
+        let version = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        if version != HVF_GIC_STATE_VERSION {
+            return Err(format!(
+                "HvfGicState version mismatch: expected {HVF_GIC_STATE_VERSION}, got {version}"
+            ));
+        }
+        let dist_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        let redist_count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        let mut distributor = Vec::with_capacity(dist_len);
+        for _ in 0..dist_len {
+            distributor.push(u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()));
+            pos += 8;
+        }
+        let mut redistributor = Vec::with_capacity(redist_count);
+        for _ in 0..redist_count {
+            let n = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            let mut vcpu = Vec::with_capacity(n);
+            for _ in 0..n {
+                vcpu.push(u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()));
+                pos += 8;
+            }
+            redistributor.push(vcpu);
+        }
+        Ok(Self {
+            distributor,
+            redistributor,
+        })
+    }
+}
+
+/// Capture GICv3 state across the whole VM (distributor + every vCPU's
+/// redistributor). Caller must have paused all vCPUs first — GIC get/set
+/// is read-modify-write on shared state.
+///
+/// `vcpu_count` is the number of vCPUs whose redistributors to capture.
+pub fn save_gic_state(vcpu_count: u32) -> Result<HvfGicState, Error> {
+    let mut distributor = Vec::with_capacity(HVF_GIC_DISTRIBUTOR_REG_IDS.len());
+    for &reg in HVF_GIC_DISTRIBUTOR_REG_IDS {
+        let mut value: u64 = 0;
+        let ret = unsafe { hv_gic_get_distributor_reg(reg, &mut value as *mut _) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuReadSystemRegister);
+        }
+        distributor.push(value);
+    }
+    let mut redistributor = Vec::with_capacity(vcpu_count as usize);
+    for vcpu_id in 0..vcpu_count {
+        let mut vcpu_regs = Vec::with_capacity(HVF_GIC_REDISTRIBUTOR_REG_IDS.len());
+        for &reg in HVF_GIC_REDISTRIBUTOR_REG_IDS {
+            let mut value: u64 = 0;
+            let ret = unsafe {
+                hv_gic_get_redistributor_reg(vcpu_id as u64, reg, &mut value as *mut _)
+            };
+            if ret != HV_SUCCESS {
+                return Err(Error::VcpuReadSystemRegister);
+            }
+            vcpu_regs.push(value);
+        }
+        redistributor.push(vcpu_regs);
+    }
+    Ok(HvfGicState {
+        distributor,
+        redistributor,
+    })
+}
+
+/// Restore GICv3 state. Order matters: the GIC must be in the same
+/// state as at snapshot time before vCPUs run.
+pub fn restore_gic_state(state: &HvfGicState) -> Result<(), Error> {
+    if state.distributor.len() != HVF_GIC_DISTRIBUTOR_REG_IDS.len() {
+        return Err(Error::VcpuInitialRegisters);
+    }
+    for (idx, &reg) in HVF_GIC_DISTRIBUTOR_REG_IDS.iter().enumerate() {
+        let ret = unsafe { hv_gic_set_distributor_reg(reg, state.distributor[idx]) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetSystemRegister(reg, state.distributor[idx]));
+        }
+    }
+    for (vcpu_id, vcpu_regs) in state.redistributor.iter().enumerate() {
+        if vcpu_regs.len() != HVF_GIC_REDISTRIBUTOR_REG_IDS.len() {
+            return Err(Error::VcpuInitialRegisters);
+        }
+        for (idx, &reg) in HVF_GIC_REDISTRIBUTOR_REG_IDS.iter().enumerate() {
+            let ret = unsafe {
+                hv_gic_set_redistributor_reg(vcpu_id as u64, reg, vcpu_regs[idx])
+            };
+            if ret != HV_SUCCESS {
+                return Err(Error::VcpuSetSystemRegister(
+                    u16::try_from(reg).unwrap_or(0),
+                    vcpu_regs[idx],
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl HvfVcpu<'_> {
     /// Capture this vCPU's HVF state. The vCPU must not be currently
     /// executing in `run()` — HVF rejects register get/set on a running

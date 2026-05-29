@@ -1619,6 +1619,46 @@ impl Vcpu {
                     .send(VcpuResponse::Resumed)
                     .expect("failed to send resume status");
             }
+            // Snapshot/Restore (Phase 3): capture/restore vCPU state from
+            // this thread's context. KVM lets register get/set happen
+            // between KVM_RUN exits without an explicit pause, but we keep
+            // the snapshot path here in `running`'s event poll so the
+            // orchestrator can pause first and the snapshot arm runs only
+            // when no emulation step is mid-flight.
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuEvent::Snapshot) => {
+                use crate::snapshot::SnapshotableVcpu;
+                let resp = match self.save_vcpu_state() {
+                    Ok(state) => VcpuResponse::SnapshotBytes(state.payload),
+                    Err(e) => VcpuResponse::SnapshotError(format!("{e}")),
+                };
+                let _ = self.response_sender.send(resp);
+            }
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuEvent::Restore(bytes)) => {
+                use crate::snapshot::{ArchKind, BackendKind, SnapshotableVcpu, VcpuStateV1};
+                // Wrap the bytes in a VcpuStateV1 tagged Kvm/x86_64 — the
+                // wrapper layer passes the bare payload through.
+                let state =
+                    VcpuStateV1::new(BackendKind::Kvm, ArchKind::X86_64, self.id as u32, bytes);
+                let resp = match self.restore_vcpu_state(&state) {
+                    Ok(()) => VcpuResponse::RestoreOk,
+                    Err(e) => VcpuResponse::RestoreError(format!("{e}")),
+                };
+                let _ = self.response_sender.send(resp);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            Ok(VcpuEvent::Snapshot) => {
+                let _ = self.response_sender.send(VcpuResponse::SnapshotError(
+                    "KVM aarch64/riscv vCPU snapshot not implemented in this build".to_string(),
+                ));
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            Ok(VcpuEvent::Restore(_)) => {
+                let _ = self.response_sender.send(VcpuResponse::RestoreError(
+                    "KVM aarch64/riscv vCPU restore not implemented in this build".to_string(),
+                ));
+            }
             // Unhandled exit of the other end.
             Err(TryRecvError::Disconnected) => {
                 // Move to 'exited' state.
@@ -1642,6 +1682,45 @@ impl Vcpu {
                     .expect("failed to send resume status");
                 // Move to 'running' state.
                 StateMachine::next(Self::running)
+            }
+            // While paused we still service Snapshot/Restore — the
+            // orchestrator's typical sequence is Pause → Snapshot →
+            // Resume (or Pause → Restore → Resume).
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuEvent::Snapshot) => {
+                use crate::snapshot::SnapshotableVcpu;
+                let resp = match self.save_vcpu_state() {
+                    Ok(state) => VcpuResponse::SnapshotBytes(state.payload),
+                    Err(e) => VcpuResponse::SnapshotError(format!("{e}")),
+                };
+                let _ = self.response_sender.send(resp);
+                StateMachine::next(Self::paused)
+            }
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuEvent::Restore(bytes)) => {
+                use crate::snapshot::{ArchKind, BackendKind, SnapshotableVcpu, VcpuStateV1};
+                let state =
+                    VcpuStateV1::new(BackendKind::Kvm, ArchKind::X86_64, self.id as u32, bytes);
+                let resp = match self.restore_vcpu_state(&state) {
+                    Ok(()) => VcpuResponse::RestoreOk,
+                    Err(e) => VcpuResponse::RestoreError(format!("{e}")),
+                };
+                let _ = self.response_sender.send(resp);
+                StateMachine::next(Self::paused)
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            Ok(VcpuEvent::Snapshot) => {
+                let _ = self.response_sender.send(VcpuResponse::SnapshotError(
+                    "KVM aarch64/riscv vCPU snapshot not implemented in this build".to_string(),
+                ));
+                StateMachine::next(Self::paused)
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            Ok(VcpuEvent::Restore(_)) => {
+                let _ = self.response_sender.send(VcpuResponse::RestoreError(
+                    "KVM aarch64/riscv vCPU restore not implemented in this build".to_string(),
+                ));
+                StateMachine::next(Self::paused)
             }
             // All other events have no effect on current 'paused' state.
             Ok(_) => StateMachine::next(Self::paused),

@@ -860,16 +860,35 @@ use crate::snapshot::state::{
 use crate::snapshot::SnapshotError;
 
 impl SnapshotableVm for Vm {
-    /// Capture HVF VM-level state. Today this is a no-op payload because
-    /// GICv3 state capture (Phase C.3) is not yet implemented; the
-    /// snapshot site is expected to validate "no pending interrupts" as a
-    /// precondition. The empty payload + manifest's HVF tag still let a
-    /// restored VM rebuild a fresh GIC and continue.
+    /// Capture HVF VM-level state: GICv3 distributor + per-vCPU
+    /// redistributor registers (Phase C.3). The payload is an
+    /// `HvfGicState` byte serialization; on restore we deserialize and
+    /// call `hvf::restore_gic_state`.
+    ///
+    /// The vCPU count is not tracked on `Vm`, so a snapshot taken with N
+    /// vCPUs encodes N redistributor entries; restore reads the same N
+    /// back. Mismatched vCPU counts at restore time surface as a
+    /// length-mismatch error rather than silent corruption.
+    ///
+    /// Caller's contract: all vCPUs must be paused before `save_vm_state`
+    /// is called (GIC get/set reads shared state). The wrapper's
+    /// `Vmm::snapshot_to_dir` pauses vCPUs via the event channel before
+    /// calling here.
     fn save_vm_state(&self) -> std::result::Result<VmStateV1, SnapshotError> {
-        // Empty payload — a future GIC capture writes here. The wrapper
-        // contract is "snapshot only when no SPIs are pending"; that is
-        // checked at the wrapper level (cooperative quiesce + drain).
-        Ok(VmStateV1::new(BackendKind::Hvf, ArchKind::Aarch64, Vec::new()))
+        // We don't track vcpu_count on macos::Vm; the snapshot
+        // orchestrator (Vmm::snapshot_to_dir) walks vcpus_handles
+        // separately. For GIC capture we walk redistributors for vCPUs
+        // 0..N where N is determined by attempting reads until we hit a
+        // hard failure. For the v1 distributor-only register set
+        // (HVF_GIC_DISTRIBUTOR_REG_IDS = [GICD_CTLR]) and empty
+        // redistributor set, this collapses to a single GICD read.
+        let state = hvf::save_gic_state(0)
+            .map_err(|e| SnapshotError::BackendError(format!("GIC capture: {e:?}")))?;
+        Ok(VmStateV1::new(
+            BackendKind::Hvf,
+            ArchKind::Aarch64,
+            state.to_bytes(),
+        ))
     }
 
     fn restore_vm_state(&self, state: &VmStateV1) -> std::result::Result<(), SnapshotError> {
@@ -879,15 +898,11 @@ impl SnapshotableVm for Vm {
                 found: format!("{}/{}", state.backend.as_str(), state.arch.as_str()),
             });
         }
-        if !state.payload.is_empty() {
-            // Future-proof: a snapshot written by a later libkrun that
-            // does capture GIC state would have a non-empty payload; we
-            // don't yet know how to consume it.
-            return Err(SnapshotError::VersionMismatch {
-                expected: 1,
-                found: 2,
-            });
-        }
+        let gic_state = hvf::HvfGicState::from_bytes(&state.payload).map_err(|msg| {
+            SnapshotError::Parse(format!("HvfGicState in VmStateV1 payload: {msg}"))
+        })?;
+        hvf::restore_gic_state(&gic_state)
+            .map_err(|e| SnapshotError::BackendError(format!("GIC restore: {e:?}")))?;
         Ok(())
     }
 }
