@@ -458,6 +458,15 @@ impl Vcpu {
             .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
 
         loop {
+            // Drain any host-side events (Pause / Resume / Snapshot /
+            // Restore) before the next emulation step. try_recv is
+            // non-blocking; this adds at most one event-channel poll per
+            // run() iteration.
+            if self.handle_pending_events(&hvf_vcpu) {
+                // Stop event received — exit.
+                self.exit(FC_EXIT_CODE_OK);
+                break;
+            }
             match self.run_emulation(&mut hvf_vcpu) {
                 // Emulation ran successfully, continue.
                 Ok(VcpuEmulation::Handled) => (),
@@ -481,6 +490,79 @@ impl Vcpu {
                     self.exit(FC_EXIT_CODE_GENERIC_ERROR);
                     break;
                 }
+            }
+        }
+    }
+
+    /// Drain pending host-side events. Snapshot/Restore are handled here
+    /// rather than mid-emulation because HVF rejects register get/set on a
+    /// running vCPU. Pause/Resume keep the existing wait-for-resume
+    /// semantics. Returns true if the caller should stop the run loop.
+    fn handle_pending_events(&mut self, hvf_vcpu: &hvf::HvfVcpu) -> bool {
+        loop {
+            match self.event_receiver.try_recv() {
+                Ok(VcpuEvent::Pause) => {
+                    let _ = self.response_sender.send(VcpuResponse::Paused);
+                    // Block until Resume / Snapshot / Restore.
+                    self.wait_for_resume_event(hvf_vcpu);
+                }
+                Ok(VcpuEvent::Resume) => {
+                    let _ = self.response_sender.send(VcpuResponse::Resumed);
+                }
+                Ok(VcpuEvent::Snapshot) => {
+                    let response = match hvf_vcpu.save_state() {
+                        Ok(state) => VcpuResponse::SnapshotBytes(state.to_bytes()),
+                        Err(e) => VcpuResponse::SnapshotError(format!("{e:?}")),
+                    };
+                    let _ = self.response_sender.send(response);
+                }
+                Ok(VcpuEvent::Restore(bytes)) => {
+                    let response = match hvf::HvfVcpuState::from_bytes(&bytes) {
+                        Err(msg) => VcpuResponse::RestoreError(msg),
+                        Ok(state) => match hvf_vcpu.restore_state(&state) {
+                            Ok(()) => VcpuResponse::RestoreOk,
+                            Err(e) => VcpuResponse::RestoreError(format!("{e:?}")),
+                        },
+                    };
+                    let _ = self.response_sender.send(response);
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+
+    /// While paused, keep servicing Snapshot / Restore / Resume events.
+    /// Used by handle_pending_events when a Pause arrives — we sit here
+    /// processing further events until a Resume or Stop comes in.
+    fn wait_for_resume_event(&mut self, hvf_vcpu: &hvf::HvfVcpu) {
+        loop {
+            match self.event_receiver.recv() {
+                Ok(VcpuEvent::Resume) => {
+                    let _ = self.response_sender.send(VcpuResponse::Resumed);
+                    return;
+                }
+                Ok(VcpuEvent::Pause) => {
+                    // Redundant pause; ack and keep waiting.
+                    let _ = self.response_sender.send(VcpuResponse::Paused);
+                }
+                Ok(VcpuEvent::Snapshot) => {
+                    let response = match hvf_vcpu.save_state() {
+                        Ok(state) => VcpuResponse::SnapshotBytes(state.to_bytes()),
+                        Err(e) => VcpuResponse::SnapshotError(format!("{e:?}")),
+                    };
+                    let _ = self.response_sender.send(response);
+                }
+                Ok(VcpuEvent::Restore(bytes)) => {
+                    let response = match hvf::HvfVcpuState::from_bytes(&bytes) {
+                        Err(msg) => VcpuResponse::RestoreError(msg),
+                        Ok(state) => match hvf_vcpu.restore_state(&state) {
+                            Ok(()) => VcpuResponse::RestoreOk,
+                            Err(e) => VcpuResponse::RestoreError(format!("{e:?}")),
+                        },
+                    };
+                    let _ = self.response_sender.send(response);
+                }
+                Err(_) => return,
             }
         }
     }
@@ -525,20 +607,27 @@ impl Drop for Vcpu {
     }
 }
 
-// Allow currently unused Pause and Exit events. These will be used by the vmm later on.
-#[allow(unused)]
-#[derive(Debug)]
 /// List of events that the Vcpu can receive.
+#[derive(Debug)]
 pub enum VcpuEvent {
     /// Pause the Vcpu.
     Pause,
     /// Event that should resume the Vcpu.
     Resume,
-    // Serialize and Deserialize to follow after we get the support from kvm-ioctls.
+    /// Capture this vCPU's HVF state and reply with `VcpuResponse::SnapshotBytes`
+    /// containing `HvfVcpuState::to_bytes()`. The vCPU thread handles this
+    /// between HVF run() iterations so HVF's "no register access while
+    /// running" rule is respected.
+    Snapshot,
+    /// Restore this vCPU's HVF state from `HvfVcpuState::from_bytes(bytes)`
+    /// and reply with `VcpuResponse::RestoreOk` or `RestoreError`. The vCPU
+    /// must not be running between the time this event is sent and the
+    /// reply is received.
+    Restore(Vec<u8>),
 }
 
-#[derive(Debug, Eq, PartialEq)]
 /// List of responses that the Vcpu reports.
+#[derive(Debug)]
 pub enum VcpuResponse {
     /// Vcpu is paused.
     Paused,
@@ -546,7 +635,31 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu is stopped.
     Exited(u8),
+    /// Captured HVF state bytes for a Snapshot event.
+    SnapshotBytes(Vec<u8>),
+    /// Capture failed.
+    SnapshotError(String),
+    /// Restore completed successfully.
+    RestoreOk,
+    /// Restore failed.
+    RestoreError(String),
 }
+
+impl PartialEq for VcpuResponse {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (VcpuResponse::Paused, VcpuResponse::Paused) => true,
+            (VcpuResponse::Resumed, VcpuResponse::Resumed) => true,
+            (VcpuResponse::Exited(a), VcpuResponse::Exited(b)) => a == b,
+            (VcpuResponse::SnapshotBytes(a), VcpuResponse::SnapshotBytes(b)) => a == b,
+            (VcpuResponse::SnapshotError(a), VcpuResponse::SnapshotError(b)) => a == b,
+            (VcpuResponse::RestoreOk, VcpuResponse::RestoreOk) => true,
+            (VcpuResponse::RestoreError(a), VcpuResponse::RestoreError(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+impl Eq for VcpuResponse {}
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
 pub struct VcpuHandle {

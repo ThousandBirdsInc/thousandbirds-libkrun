@@ -51,7 +51,6 @@ use std::time::Duration;
 #[cfg(target_arch = "x86_64")]
 use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
-#[cfg(target_os = "linux")]
 use crate::vstate::VcpuEvent;
 use crate::vstate::{Vcpu, VcpuHandle, VcpuResponse, Vm};
 
@@ -134,6 +133,9 @@ pub enum Error {
     VcpuResume,
     /// Cannot spawn a new Vcpu thread.
     VcpuSpawn(std::io::Error),
+    /// Snapshot or restore operation failed. Message describes the cause
+    /// (I/O, format mismatch, vCPU communication, etc).
+    Snapshot(String),
     /// Vm error.
     Vm(vstate::Error),
     /// Error thrown by observer object on Vmm initialization.
@@ -169,6 +171,7 @@ impl Display for Error {
             VcpuHandle(e) => write!(f, "Cannot create a vCPU handle. {e}"),
             VcpuResume => write!(f, "vCPUs resume failed."),
             VcpuSpawn(e) => write!(f, "Cannot spawn Vcpu thread: {e}"),
+            Snapshot(msg) => write!(f, "Snapshot/restore error: {msg}"),
             Vm(e) => write!(f, "Vm error: {e}"),
             VmmObserverInit(e) => write!(
                 f,
@@ -376,6 +379,222 @@ impl Vmm {
     }
 
     /// Waits for all vCPUs to exit and terminates the Firecracker process.
+    /// Capture a full snapshot of this VM to `path`. Pauses every vCPU,
+    /// captures their state via the existing event channel + the
+    /// `SnapshotableVm` trait, walks guest memory regions, then resumes
+    /// vCPUs and returns. Files written under `path`:
+    ///
+    /// - `snapshot.bin` — `VmStateV1` (VM-level state, e.g. KVM IRQ chip
+    ///   or HVF GIC placeholder).
+    /// - `vcpu_NNN.bin` — `VcpuStateV1` per vCPU (NNN = cpu index, 3-digit
+    ///   zero-padded).
+    /// - `memory.bin` — sparse `MemoryImage` walking `GuestMemoryMmap`.
+    ///
+    /// The caller (typically `krun_snapshot_to_path` or a control-socket
+    /// command) is responsible for any guest-side cooperative quiesce
+    /// before invoking this — the wrapper's quiesce daemon (sync +
+    /// optionally fsfreeze) is the canonical layer for that.
+    pub fn snapshot_to_dir(&mut self, path: &std::path::Path) -> Result<()> {
+        use crate::snapshot::{
+            MemoryImageWriter, MemoryRegionMeta, SnapshotableVm, VcpuStateV1, MEMORY_IMAGE_FILE,
+            VCPU_STATE_FILE_PREFIX, VM_STATE_FILE,
+        };
+        use vm_memory::{Address, Bytes, GuestMemory, GuestMemoryRegion};
+
+        std::fs::create_dir_all(path)
+            .map_err(|e| Error::Snapshot(format!("create snapshot dir {path:?}: {e}")))?;
+
+        // 1. Pause every vCPU. We track which ones we paused so we can
+        //    Resume them even on the error path.
+        let mut paused = Vec::with_capacity(self.vcpus_handles.len());
+        for handle in &self.vcpus_handles {
+            if handle.send_event(VcpuEvent::Pause).is_ok() {
+                paused.push(handle);
+                let _ = handle.response_receiver().recv();
+            }
+        }
+
+        let outcome = (|| -> Result<()> {
+            // 2. Capture each vCPU's state through the same event channel.
+            //    Holding the Pause means the vCPU thread is in
+            //    wait_for_resume_event, which services Snapshot events.
+            for (idx, handle) in self.vcpus_handles.iter().enumerate() {
+                handle
+                    .send_event(VcpuEvent::Snapshot)
+                    .map_err(|e| Error::Snapshot(format!("send Snapshot to vCPU {idx}: {e:?}")))?;
+                let bytes = match handle.response_receiver().recv() {
+                    Ok(VcpuResponse::SnapshotBytes(b)) => b,
+                    Ok(VcpuResponse::SnapshotError(msg)) => {
+                        return Err(Error::Snapshot(format!("vCPU {idx} snapshot failed: {msg}")));
+                    }
+                    other => {
+                        return Err(Error::Snapshot(format!(
+                            "vCPU {idx} snapshot: unexpected response: {other:?}"
+                        )));
+                    }
+                };
+                let arch = if cfg!(target_arch = "x86_64") {
+                    crate::snapshot::ArchKind::X86_64
+                } else {
+                    crate::snapshot::ArchKind::Aarch64
+                };
+                let backend = if cfg!(target_os = "linux") {
+                    crate::snapshot::BackendKind::Kvm
+                } else {
+                    crate::snapshot::BackendKind::Hvf
+                };
+                let state = VcpuStateV1::new(backend, arch, idx as u32, bytes);
+                let vcpu_path = path.join(format!("{VCPU_STATE_FILE_PREFIX}{idx:03}.bin"));
+                let mut f = std::fs::File::create(&vcpu_path)
+                    .map_err(|e| Error::Snapshot(format!("io: {e}")))?;
+                state
+                    .write_to(&mut f)
+                    .map_err(|e| Error::Snapshot(e.to_string()))?;
+            }
+
+            // 3. VM-level state (KVM IRQ chip or HVF GIC placeholder).
+            let vm_state = self
+                .vm
+                .save_vm_state()
+                .map_err(|e| Error::Snapshot(e.to_string()))?;
+            let vm_state_path = path.join(VM_STATE_FILE);
+            let mut f = std::fs::File::create(&vm_state_path)
+                .map_err(|e| Error::Snapshot(format!("io: {e}")))?;
+            vm_state.write_to(&mut f).map_err(|e| {
+                Error::Snapshot(e.to_string())
+            })?;
+
+            // 4. Walk guest memory regions and write a sparse image.
+            let regions: Vec<MemoryRegionMeta> = self
+                .guest_memory
+                .iter()
+                .map(|r| MemoryRegionMeta {
+                    guest_phys_base: r.start_addr().raw_value(),
+                    size: r.len(),
+                    sparse: true,
+                })
+                .collect();
+            let mut writer = MemoryImageWriter::create(&path.join(MEMORY_IMAGE_FILE), &regions)
+                .map_err(|e| {
+                    Error::Snapshot(e.to_string())
+                })?;
+            for (idx, region) in self.guest_memory.iter().enumerate() {
+                // Copy the region's bytes out of guest memory into a host
+                // buffer for sparse writing. Note: for very large memory
+                // this could be streamed page-at-a-time; v1 prioritizes
+                // correctness over peak memory.
+                let mut buf = vec![0u8; region.len() as usize];
+                self.guest_memory
+                    .read_slice(&mut buf, region.start_addr())
+                    .map_err(|e| {
+                        Error::Snapshot(format!("guest memory read at region {idx}: {e:?}"),
+                        )
+                    })?;
+                writer.write_region(idx, &buf).map_err(|e| {
+                    Error::Snapshot(e.to_string())
+                })?;
+            }
+            writer.finalize().map_err(|e| {
+                Error::Snapshot(e.to_string())
+            })?;
+            Ok(())
+        })();
+
+        // 5. Resume all paused vCPUs, regardless of outcome.
+        for handle in paused {
+            if handle.send_event(VcpuEvent::Resume).is_ok() {
+                let _ = handle.response_receiver().recv();
+            }
+        }
+        outcome
+    }
+
+    /// Restore VM state from a directory previously written by
+    /// `snapshot_to_dir`. Reads the memory image into guest memory and the
+    /// VM/vCPU state files, applies them via the `SnapshotableVm` /
+    /// `SnapshotableVcpu` paths.
+    ///
+    /// Must be called **after** memory is mapped (so guest memory exists to
+    /// write into) but **before** `start_vcpus`. vCPU state files are
+    /// applied later via `apply_vcpu_state_to_handles` once vcpu threads
+    /// are spawned (their thread is the only one allowed to call HVF
+    /// register set on aarch64).
+    pub fn restore_memory_and_vm_state(&mut self, path: &std::path::Path) -> Result<()> {
+        use crate::snapshot::{
+            MemoryImageReader, SnapshotableVm, VmStateV1, MEMORY_IMAGE_FILE, VM_STATE_FILE,
+        };
+        use vm_memory::{Bytes, GuestAddress, GuestMemory};
+
+        // 1. Memory image into guest memory.
+        let mem_path = path.join(MEMORY_IMAGE_FILE);
+        let mut reader = MemoryImageReader::open(&mem_path).map_err(|e| {
+            Error::Snapshot(e.to_string(),
+            )
+        })?;
+        for (idx, desc) in reader.descriptors.clone().iter().enumerate() {
+            let mut buf = vec![0u8; desc.size as usize];
+            reader.read_region(idx, &mut buf).map_err(|e| {
+                Error::Snapshot(e.to_string())
+            })?;
+            self.guest_memory
+                .write_slice(&buf, GuestAddress(desc.guest_phys_base))
+                .map_err(|e| {
+                    Error::Snapshot(format!("guest memory write at region {idx}: {e:?}"),
+                    )
+                })?;
+        }
+
+        // 2. VM-level state.
+        let vm_state_path = path.join(VM_STATE_FILE);
+        let mut f = std::fs::File::open(&vm_state_path)
+            .map_err(|e| Error::Snapshot(format!("io: {e}")))?;
+        let vm_state = VmStateV1::read_from(&mut f).map_err(|e| {
+            Error::Snapshot(e.to_string(),
+            )
+        })?;
+        self.vm.restore_vm_state(&vm_state).map_err(|e| {
+            Error::Snapshot(e.to_string(),
+            )
+        })?;
+        // Sanity check region count matches what was captured.
+        let live_regions = self.guest_memory.iter().count();
+        if live_regions != reader.descriptors.len() {
+            return Err(Error::Snapshot(format!(
+                "snapshot has {} memory regions but live VM has {live_regions}",
+                reader.descriptors.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// After vCPU threads are spawned (`start_vcpus`), apply each
+    /// `vcpu_NNN.bin` file by sending a Restore event to the matching
+    /// vcpu_handle. The vCPU thread calls `HvfVcpu::restore_state` (or
+    /// the KVM equivalent) from its own context.
+    pub fn apply_vcpu_state_to_handles(&self, path: &std::path::Path) -> Result<()> {
+        use crate::snapshot::{VcpuStateV1, VCPU_STATE_FILE_PREFIX};
+        for (idx, handle) in self.vcpus_handles.iter().enumerate() {
+            let vcpu_path = path.join(format!("{VCPU_STATE_FILE_PREFIX}{idx:03}.bin"));
+            let mut f = std::fs::File::open(&vcpu_path)
+                .map_err(|e| Error::Snapshot(format!("io: {e}")))?;
+            let state = VcpuStateV1::read_from(&mut f).map_err(|e| {
+                Error::Snapshot(e.to_string())
+            })?;
+            handle
+                .send_event(VcpuEvent::Restore(state.payload))
+                .map_err(|_| Error::Snapshot("vcpu communication failed".to_string()))?;
+            match handle.response_receiver().recv() {
+                Ok(VcpuResponse::RestoreOk) => {}
+                Ok(VcpuResponse::RestoreError(msg)) => {
+                    error!("vCPU {idx} restore failed: {msg}");
+                    return Err(Error::Snapshot("vcpu communication failed".to_string()));
+                }
+                _ => return Err(Error::Snapshot("vcpu communication failed".to_string())),
+            }
+        }
+        Ok(())
+    }
+
     pub fn stop(&mut self, exit_code: i32) {
         info!("Vmm is stopping.");
 

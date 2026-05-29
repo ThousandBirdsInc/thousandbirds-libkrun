@@ -57,7 +57,10 @@ pub mod memory;
 pub mod state;
 
 pub use error::SnapshotError;
-pub use memory::{MemoryImageReader, MemoryImageWriter, MEMORY_IMAGE_FILE};
+pub use memory::{
+    MemoryImageReader, MemoryImageWriter, MemoryRegionDescriptor, MemoryRegionMeta,
+    MEMORY_IMAGE_FILE,
+};
 pub use state::{
     ArchKind, BackendKind, SnapshotableVcpu, SnapshotableVm, VcpuStateV1, VmStateV1,
     SNAPSHOT_FORMAT_VERSION, VCPU_STATE_FILE_PREFIX, VM_STATE_FILE,

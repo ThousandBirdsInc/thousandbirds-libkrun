@@ -1716,20 +1716,22 @@ pub struct VcpuState {
     xsave: kvm_xsave,
 }
 
-// Allow currently unused Pause and Exit events. These will be used by the vmm later on.
-#[allow(unused)]
-#[derive(Debug)]
 /// List of events that the Vcpu can receive.
+#[derive(Debug)]
 pub enum VcpuEvent {
     /// Pause the Vcpu.
     Pause,
     /// Event that should resume the Vcpu.
     Resume,
-    // Serialize and Deserialize to follow after we get the support from kvm-ioctls.
+    /// Capture state — see the macOS counterpart for the protocol. On KVM
+    /// this is honored by calling SnapshotableVcpu on the running Vcpu.
+    Snapshot,
+    /// Restore state from bytes — see macOS counterpart.
+    Restore(Vec<u8>),
 }
 
-#[derive(Debug, Eq, PartialEq)]
 /// List of responses that the Vcpu reports.
+#[derive(Debug)]
 pub enum VcpuResponse {
     /// Vcpu is paused.
     Paused,
@@ -1737,7 +1739,31 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu is stopped.
     Exited(u8),
+    /// Captured state bytes for a Snapshot event.
+    SnapshotBytes(Vec<u8>),
+    /// Snapshot failed.
+    SnapshotError(String),
+    /// Restore completed.
+    RestoreOk,
+    /// Restore failed.
+    RestoreError(String),
 }
+
+impl PartialEq for VcpuResponse {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (VcpuResponse::Paused, VcpuResponse::Paused) => true,
+            (VcpuResponse::Resumed, VcpuResponse::Resumed) => true,
+            (VcpuResponse::Exited(a), VcpuResponse::Exited(b)) => a == b,
+            (VcpuResponse::SnapshotBytes(a), VcpuResponse::SnapshotBytes(b)) => a == b,
+            (VcpuResponse::SnapshotError(a), VcpuResponse::SnapshotError(b)) => a == b,
+            (VcpuResponse::RestoreOk, VcpuResponse::RestoreOk) => true,
+            (VcpuResponse::RestoreError(a), VcpuResponse::RestoreError(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+impl Eq for VcpuResponse {}
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
 pub struct VcpuHandle {

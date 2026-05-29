@@ -34,6 +34,7 @@ use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::slice;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use utils::eventfd::EventFd;
@@ -872,15 +873,30 @@ pub unsafe extern "C" fn krun_snapshot_to_path(ctx_id: u32, path: *const c_char)
     if path.is_null() {
         return -libc::EINVAL;
     }
-    let _ = match CStr::from_ptr(path).to_str() {
+    let path = match CStr::from_ptr(path).to_str() {
         Ok(p) => PathBuf::from(p),
         Err(_) => return -libc::EINVAL,
     };
-    if !CTX_MAP.lock().unwrap().contains_key(&ctx_id) {
-        return -libc::ENOENT;
+    let vmm = match LIVE_VMM_MAP.lock().unwrap().get(&ctx_id).cloned() {
+        Some(vmm) => vmm,
+        None => return -libc::ENOENT,
+    };
+    let mut vmm = vmm.lock().unwrap();
+    match vmm.snapshot_to_dir(&path) {
+        Ok(()) => KRUN_SUCCESS,
+        Err(e) => {
+            error!("krun_snapshot_to_path: {e}");
+            -libc::EIO
+        }
     }
-    -libc::ENOSYS
 }
+
+/// Map of ctx_id → live Vmm. Populated by `krun_start_enter` once the
+/// VM is built; consulted by `krun_snapshot_to_path` for the runtime
+/// snapshot path. Kept separate from `CTX_MAP` (which holds the
+/// *configuration* and is consumed by `krun_start_enter`).
+static LIVE_VMM_MAP: Lazy<Mutex<HashMap<u32, Arc<Mutex<vmm::Vmm>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
@@ -3147,6 +3163,7 @@ fn spawn_balloon_control_listener(
     socket_path: PathBuf,
     ceiling_mib: u32,
     control: devices::virtio::BalloonControl,
+    vmm: Arc<Mutex<vmm::Vmm>>,
 ) {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
@@ -3192,7 +3209,15 @@ fn spawn_balloon_control_listener(
                         Ok(line) => line,
                         Err(_) => break,
                     };
-                    let response = handle_balloon_command(line.trim(), ceiling_mib, &control);
+                    let trimmed = line.trim();
+                    // Dispatch by first token. snapshot-memory PATH routes
+                    // through the live VMM; everything else is a balloon
+                    // command on the existing handler.
+                    let response = if let Some(rest) = trimmed.strip_prefix("snapshot-memory ") {
+                        handle_snapshot_command(rest.trim(), &vmm)
+                    } else {
+                        handle_balloon_command(trimmed, ceiling_mib, &control)
+                    };
                     if writeln!(writer, "{response}").is_err() {
                         break;
                     }
@@ -3232,6 +3257,25 @@ fn handle_balloon_command(
         },
         Some(other) => format!("error unknown command: {other}"),
         None => "error empty command".to_string(),
+    }
+}
+
+/// Handle a `snapshot-memory <path>` command from the control socket.
+/// Pauses vCPUs, walks state via the SnapshotableVm/Vcpu traits, writes
+/// the snapshot directory, resumes vCPUs. Response: `ok` on success,
+/// `error <msg>` otherwise.
+fn handle_snapshot_command(arg: &str, vmm: &Arc<Mutex<vmm::Vmm>>) -> String {
+    if arg.is_empty() {
+        return "error usage: snapshot-memory <path>".to_string();
+    }
+    let path = PathBuf::from(arg);
+    let mut vmm = match vmm.lock() {
+        Ok(v) => v,
+        Err(poison) => poison.into_inner(),
+    };
+    match vmm.snapshot_to_dir(&path) {
+        Ok(()) => format!("ok path={}", path.display()),
+        Err(e) => format!("error {e}"),
     }
 }
 
@@ -3431,6 +3475,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     // socket once the (resize-capable) balloon device exists.
     let balloon_socket = ctx_cfg.balloon_control_socket.take();
     let balloon_ceiling_mib = ctx_cfg.vmr.vm_config().mem_size_mib.unwrap_or(0) as u32;
+    let snapshot_restore_from = ctx_cfg.snapshot_restore_from.take();
 
     let _vmm = match vmm::builder::build_microvm(
         &ctx_cfg.vmr,
@@ -3445,11 +3490,42 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     };
 
+    // Phase D runtime: if a restore path was configured, replay memory +
+    // VM-level state into the freshly-built VM, then apply vCPU state via
+    // the event channel once vCPU threads exist. build_microvm spawned the
+    // vCPU threads via start_vcpus internally, so apply_vcpu_state_to_handles
+    // is safe to call now.
+    if let Some(restore_path) = snapshot_restore_from {
+        let mut vmm = _vmm.lock().unwrap();
+        if let Err(e) = vmm.restore_memory_and_vm_state(&restore_path) {
+            error!("krun_start_enter: restore memory+vm state from {restore_path:?}: {e}");
+            return -libc::EIO;
+        }
+        if let Err(e) = vmm.apply_vcpu_state_to_handles(&restore_path) {
+            error!("krun_start_enter: restore vCPU state from {restore_path:?}: {e}");
+            return -libc::EIO;
+        }
+        info!("krun_start_enter: restored VM from {restore_path:?}");
+    }
+
+    // Make the live VMM reachable to krun_snapshot_to_path. Removed when
+    // the event loop exits (the unsafe libc::_exit in Vmm::stop bypasses
+    // this on success, which is fine — process exit cleans up anyway).
+    LIVE_VMM_MAP
+        .lock()
+        .unwrap()
+        .insert(ctx_id, Arc::clone(&_vmm));
+
     #[cfg(not(feature = "tee"))]
     if let Some(socket_path) = balloon_socket {
         match _vmm.lock().unwrap().balloon_control() {
             Some(control) => {
-                spawn_balloon_control_listener(socket_path, balloon_ceiling_mib, control)
+                spawn_balloon_control_listener(
+                    socket_path,
+                    balloon_ceiling_mib,
+                    control,
+                    Arc::clone(&_vmm),
+                )
             }
             None => warn!(
                 "balloon control socket configured but no resize-capable balloon was attached"
