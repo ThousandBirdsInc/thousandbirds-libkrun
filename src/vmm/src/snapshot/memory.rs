@@ -114,11 +114,7 @@ impl MemoryImageWriter {
 
     /// Append a region's bytes to the image. `region_index` must match the
     /// order regions were passed to `create`.
-    pub fn write_region(
-        &mut self,
-        region_index: usize,
-        bytes: &[u8],
-    ) -> Result<(), SnapshotError> {
+    pub fn write_region(&mut self, region_index: usize, bytes: &[u8]) -> Result<(), SnapshotError> {
         if region_index != self.next_region {
             return Err(SnapshotError::MemoryWalkFailed(format!(
                 "region writes must be sequential; expected {}, got {region_index}",
@@ -215,9 +211,7 @@ impl MemoryImageReader {
         let mut header = [0u8; 16];
         file.read_exact(&mut header)?;
         if &header[..8] != MEMORY_MAGIC {
-            return Err(SnapshotError::Parse(
-                "bad memory image magic".to_string(),
-            ));
+            return Err(SnapshotError::Parse("bad memory image magic".to_string()));
         }
         let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
         if version != MEMORY_FORMAT_VERSION {

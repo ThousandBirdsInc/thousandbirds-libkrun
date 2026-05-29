@@ -425,7 +425,9 @@ impl Vmm {
                 let bytes = match handle.response_receiver().recv() {
                     Ok(VcpuResponse::SnapshotBytes(b)) => b,
                     Ok(VcpuResponse::SnapshotError(msg)) => {
-                        return Err(Error::Snapshot(format!("vCPU {idx} snapshot failed: {msg}")));
+                        return Err(Error::Snapshot(format!(
+                            "vCPU {idx} snapshot failed: {msg}"
+                        )));
                     }
                     other => {
                         return Err(Error::Snapshot(format!(
@@ -460,9 +462,9 @@ impl Vmm {
             let vm_state_path = path.join(VM_STATE_FILE);
             let mut f = std::fs::File::create(&vm_state_path)
                 .map_err(|e| Error::Snapshot(format!("io: {e}")))?;
-            vm_state.write_to(&mut f).map_err(|e| {
-                Error::Snapshot(e.to_string())
-            })?;
+            vm_state
+                .write_to(&mut f)
+                .map_err(|e| Error::Snapshot(e.to_string()))?;
 
             // 4. Walk guest memory regions and write a sparse image.
             let regions: Vec<MemoryRegionMeta> = self
@@ -475,9 +477,7 @@ impl Vmm {
                 })
                 .collect();
             let mut writer = MemoryImageWriter::create(&path.join(MEMORY_IMAGE_FILE), &regions)
-                .map_err(|e| {
-                    Error::Snapshot(e.to_string())
-                })?;
+                .map_err(|e| Error::Snapshot(e.to_string()))?;
             for (idx, region) in self.guest_memory.iter().enumerate() {
                 // Copy the region's bytes out of guest memory into a host
                 // buffer for sparse writing. Note: for very large memory
@@ -487,16 +487,15 @@ impl Vmm {
                 self.guest_memory
                     .read_slice(&mut buf, region.start_addr())
                     .map_err(|e| {
-                        Error::Snapshot(format!("guest memory read at region {idx}: {e:?}"),
-                        )
+                        Error::Snapshot(format!("guest memory read at region {idx}: {e:?}"))
                     })?;
-                writer.write_region(idx, &buf).map_err(|e| {
-                    Error::Snapshot(e.to_string())
-                })?;
+                writer
+                    .write_region(idx, &buf)
+                    .map_err(|e| Error::Snapshot(e.to_string()))?;
             }
-            writer.finalize().map_err(|e| {
-                Error::Snapshot(e.to_string())
-            })?;
+            writer
+                .finalize()
+                .map_err(|e| Error::Snapshot(e.to_string()))?;
             Ok(())
         })();
 
@@ -527,35 +526,28 @@ impl Vmm {
 
         // 1. Memory image into guest memory.
         let mem_path = path.join(MEMORY_IMAGE_FILE);
-        let mut reader = MemoryImageReader::open(&mem_path).map_err(|e| {
-            Error::Snapshot(e.to_string(),
-            )
-        })?;
+        let mut reader =
+            MemoryImageReader::open(&mem_path).map_err(|e| Error::Snapshot(e.to_string()))?;
         for (idx, desc) in reader.descriptors.clone().iter().enumerate() {
             let mut buf = vec![0u8; desc.size as usize];
-            reader.read_region(idx, &mut buf).map_err(|e| {
-                Error::Snapshot(e.to_string())
-            })?;
+            reader
+                .read_region(idx, &mut buf)
+                .map_err(|e| Error::Snapshot(e.to_string()))?;
             self.guest_memory
                 .write_slice(&buf, GuestAddress(desc.guest_phys_base))
                 .map_err(|e| {
-                    Error::Snapshot(format!("guest memory write at region {idx}: {e:?}"),
-                    )
+                    Error::Snapshot(format!("guest memory write at region {idx}: {e:?}"))
                 })?;
         }
 
         // 2. VM-level state.
         let vm_state_path = path.join(VM_STATE_FILE);
-        let mut f = std::fs::File::open(&vm_state_path)
-            .map_err(|e| Error::Snapshot(format!("io: {e}")))?;
-        let vm_state = VmStateV1::read_from(&mut f).map_err(|e| {
-            Error::Snapshot(e.to_string(),
-            )
-        })?;
-        self.vm.restore_vm_state(&vm_state).map_err(|e| {
-            Error::Snapshot(e.to_string(),
-            )
-        })?;
+        let mut f =
+            std::fs::File::open(&vm_state_path).map_err(|e| Error::Snapshot(format!("io: {e}")))?;
+        let vm_state = VmStateV1::read_from(&mut f).map_err(|e| Error::Snapshot(e.to_string()))?;
+        self.vm
+            .restore_vm_state(&vm_state)
+            .map_err(|e| Error::Snapshot(e.to_string()))?;
         // Sanity check region count matches what was captured.
         let live_regions = self.guest_memory.iter().count();
         if live_regions != reader.descriptors.len() {
@@ -575,11 +567,10 @@ impl Vmm {
         use crate::snapshot::{VcpuStateV1, VCPU_STATE_FILE_PREFIX};
         for (idx, handle) in self.vcpus_handles.iter().enumerate() {
             let vcpu_path = path.join(format!("{VCPU_STATE_FILE_PREFIX}{idx:03}.bin"));
-            let mut f = std::fs::File::open(&vcpu_path)
-                .map_err(|e| Error::Snapshot(format!("io: {e}")))?;
-            let state = VcpuStateV1::read_from(&mut f).map_err(|e| {
-                Error::Snapshot(e.to_string())
-            })?;
+            let mut f =
+                std::fs::File::open(&vcpu_path).map_err(|e| Error::Snapshot(format!("io: {e}")))?;
+            let state =
+                VcpuStateV1::read_from(&mut f).map_err(|e| Error::Snapshot(e.to_string()))?;
             handle
                 .send_event(VcpuEvent::Restore(state.payload))
                 .map_err(|_| Error::Snapshot("vcpu communication failed".to_string()))?;

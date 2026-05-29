@@ -2205,11 +2205,7 @@ mod snapshot_serde {
             let size = std::mem::size_of::<T>();
             let slice = self.read_slice(size)?;
             let mut value = std::mem::MaybeUninit::<T>::uninit();
-            std::ptr::copy_nonoverlapping(
-                slice.as_ptr(),
-                value.as_mut_ptr() as *mut u8,
-                size,
-            );
+            std::ptr::copy_nonoverlapping(slice.as_ptr(), value.as_mut_ptr() as *mut u8, size);
             Ok(value.assume_init())
         }
         pub(super) fn finished(&self) -> bool {
@@ -2296,9 +2292,8 @@ mod snapshot_serde {
                 "implausible cpuid nent {cpuid_nent}"
             )));
         }
-        let mut cpuid = CpuId::new(cpuid_nent).map_err(|e| {
-            SnapshotError::Parse(format!("CpuId::new({cpuid_nent}) failed: {e:?}"))
-        })?;
+        let mut cpuid = CpuId::new(cpuid_nent)
+            .map_err(|e| SnapshotError::Parse(format!("CpuId::new({cpuid_nent}) failed: {e:?}")))?;
         {
             let slots = cpuid.as_mut_slice();
             for slot in slots.iter_mut() {
@@ -2308,9 +2303,8 @@ mod snapshot_serde {
 
         // Msrs.
         let nmsrs = r.read_u32()? as usize;
-        let mut msrs = Msrs::new(nmsrs).map_err(|e| {
-            SnapshotError::Parse(format!("Msrs::new({nmsrs}) failed: {e:?}"))
-        })?;
+        let mut msrs = Msrs::new(nmsrs)
+            .map_err(|e| SnapshotError::Parse(format!("Msrs::new({nmsrs}) failed: {e:?}")))?;
         {
             let slots = msrs.as_mut_slice();
             for slot in slots.iter_mut() {
@@ -2421,4 +2415,3 @@ impl SnapshotableVcpu for Vcpu {
         ))
     }
 }
-

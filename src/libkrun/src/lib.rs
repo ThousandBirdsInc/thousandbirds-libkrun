@@ -831,10 +831,7 @@ pub unsafe extern "C" fn krun_set_balloon(
 /// a bad path string.
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-pub unsafe extern "C" fn krun_set_snapshot_restore_from(
-    ctx_id: u32,
-    path: *const c_char,
-) -> i32 {
+pub unsafe extern "C" fn krun_set_snapshot_restore_from(ctx_id: u32, path: *const c_char) -> i32 {
     let path_buf = if path.is_null() {
         None
     } else {
@@ -3519,14 +3516,12 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     #[cfg(not(feature = "tee"))]
     if let Some(socket_path) = balloon_socket {
         match _vmm.lock().unwrap().balloon_control() {
-            Some(control) => {
-                spawn_balloon_control_listener(
-                    socket_path,
-                    balloon_ceiling_mib,
-                    control,
-                    Arc::clone(&_vmm),
-                )
-            }
+            Some(control) => spawn_balloon_control_listener(
+                socket_path,
+                balloon_ceiling_mib,
+                control,
+                Arc::clone(&_vmm),
+            ),
             None => warn!(
                 "balloon control socket configured but no resize-capable balloon was attached"
             ),

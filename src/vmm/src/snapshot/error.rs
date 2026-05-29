@@ -17,10 +17,7 @@ pub enum SnapshotError {
     /// represent at its current version.
     BackendCapabilityMismatch(String),
     /// Loaded state does not match this libkrun build's snapshot format.
-    VersionMismatch {
-        expected: u32,
-        found: u32,
-    },
+    VersionMismatch { expected: u32, found: u32 },
     /// The backend or arch tag in a state file does not match the running
     /// VM (e.g. tried to restore an x86_64 snapshot on an aarch64 host).
     BackendMismatch {

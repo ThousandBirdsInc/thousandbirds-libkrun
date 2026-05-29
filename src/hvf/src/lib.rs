@@ -894,9 +894,8 @@ impl HvfVcpuState {
 /// banks. The full GICv3 has many more (SGI generation, message-based
 /// SPIs, etc); a future revision can extend this list. The order here is
 /// the serialization order.
-pub const HVF_GIC_DISTRIBUTOR_REG_IDS: &[u16] = &[
-    hv_gic_distributor_reg_t_HV_GIC_DISTRIBUTOR_REG_GICD_CTLR as u16,
-];
+pub const HVF_GIC_DISTRIBUTOR_REG_IDS: &[u16] =
+    &[hv_gic_distributor_reg_t_HV_GIC_DISTRIBUTOR_REG_GICD_CTLR as u16];
 
 /// Per-vCPU redistributor registers we capture/restore.
 pub const HVF_GIC_REDISTRIBUTOR_REG_IDS: &[u32] = &[];
@@ -996,9 +995,8 @@ pub fn save_gic_state(vcpu_count: u32) -> Result<HvfGicState, Error> {
         let mut vcpu_regs = Vec::with_capacity(HVF_GIC_REDISTRIBUTOR_REG_IDS.len());
         for &reg in HVF_GIC_REDISTRIBUTOR_REG_IDS {
             let mut value: u64 = 0;
-            let ret = unsafe {
-                hv_gic_get_redistributor_reg(vcpu_id as u64, reg, &mut value as *mut _)
-            };
+            let ret =
+                unsafe { hv_gic_get_redistributor_reg(vcpu_id as u64, reg, &mut value as *mut _) };
             if ret != HV_SUCCESS {
                 return Err(Error::VcpuReadSystemRegister);
             }
@@ -1029,9 +1027,7 @@ pub fn restore_gic_state(state: &HvfGicState) -> Result<(), Error> {
             return Err(Error::VcpuInitialRegisters);
         }
         for (idx, &reg) in HVF_GIC_REDISTRIBUTOR_REG_IDS.iter().enumerate() {
-            let ret = unsafe {
-                hv_gic_set_redistributor_reg(vcpu_id as u64, reg, vcpu_regs[idx])
-            };
+            let ret = unsafe { hv_gic_set_redistributor_reg(vcpu_id as u64, reg, vcpu_regs[idx]) };
             if ret != HV_SUCCESS {
                 return Err(Error::VcpuSetSystemRegister(
                     u16::try_from(reg).unwrap_or(0),

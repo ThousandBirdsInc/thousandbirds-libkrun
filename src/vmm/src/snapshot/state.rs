@@ -45,9 +45,7 @@ impl BackendKind {
         match v {
             1 => Ok(Self::Kvm),
             2 => Ok(Self::Hvf),
-            other => Err(SnapshotError::Parse(format!(
-                "unknown backend tag {other}"
-            ))),
+            other => Err(SnapshotError::Parse(format!("unknown backend tag {other}"))),
         }
     }
     pub fn as_str(self) -> &'static str {
