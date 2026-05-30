@@ -2166,6 +2166,10 @@ use crate::snapshot::SnapshotError;
 #[cfg(target_arch = "x86_64")]
 mod snapshot_serde {
     use super::*;
+    // `super::*` pulls in this module's 1-arg `Result<T> = Result<T, Error>`
+    // alias; the snapshot (de)serializers below use the std 2-arg
+    // `Result<T, SnapshotError>`, so bring std's `Result` back into scope.
+    use std::result::Result;
     use kvm_bindings::{kvm_cpuid_entry2, kvm_msr_entry};
 
     /// SAFETY: `T` must be `#[repr(C)]` POD (kvm-bindings FFI structs all
@@ -2200,8 +2204,10 @@ mod snapshot_serde {
             Ok(s)
         }
         /// SAFETY: `T` must be `#[repr(C)]` POD; the caller is responsible
-        /// for the byte layout matching `T`.
-        pub(super) unsafe fn read_pod<T: Copy>(&mut self) -> Result<T, SnapshotError> {
+        /// for the byte layout matching `T`. (No `Copy` bound: the read is a
+        /// raw byte copy into `MaybeUninit`, and some kvm-bindings POD structs
+        /// such as `kvm_xsave` are not `Copy`.)
+        pub(super) unsafe fn read_pod<T>(&mut self) -> Result<T, SnapshotError> {
             let size = std::mem::size_of::<T>();
             let slice = self.read_slice(size)?;
             let mut value = std::mem::MaybeUninit::<T>::uninit();

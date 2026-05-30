@@ -6,6 +6,15 @@
  * passed with --root-device must exist inside the guest.
  */
 
+/* glibc gates posix_openpt/grantpt/unlockpt/ptsname (used by --serial-pty)
+ * behind _GNU_SOURCE. Without it they are implicitly declared as returning
+ * int, which truncates the 64-bit pointer ptsname() returns and makes the
+ * subsequent open() fail with EFAULT. macOS declares them unconditionally, so
+ * this only bites on Linux. Must precede any system header. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <errno.h>
 #include <ctype.h>
 #include <getopt.h>

@@ -16,7 +16,12 @@ import subprocess
 import sys
 import time
 import uuid
-from datetime import UTC, datetime
+try:
+    from datetime import UTC, datetime
+except ImportError:  # Python < 3.11 (e.g. Debian/Ubuntu system python 3.10)
+    from datetime import datetime, timezone
+
+    UTC = timezone.utc
 from pathlib import Path
 
 from os_mode_manifest_check import check_manifest_payload
